@@ -100,35 +100,36 @@ def tokenize(model_desc, max_tokens=None):
     shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
 
     if max_tokens is None:
-        max_tokens = 1_000_000_000_000  # full dataset
+        max_tokens = 1_000_000_000_000   # full dataset
 
     val_target = int(max_tokens * 0.05)
     train_target = max_tokens - val_target
 
     print(f"Target split: {train_target:,} train + {val_target:,} val = {max_tokens:,} total")
 
-    # VAL split (5%)
+    # VAL split (5%) - take tokens sequentially until target
     print("Tokenizing val split...")
     val_tokens = []
     total_val = 0
-    for shard_index, shard_filename in enumerate(shard_filenames):
-        tokens = process_shard(shard_index, shard_filename, model_desc)
-        val_tokens.extend(tokens)
-        total_val += len(tokens)
-        if total_val >= val_target:
-            break
+    shard_idx = 0
+    while total_val < val_target and shard_idx < len(shard_filenames):
+        tokens = process_shard(shard_idx, shard_filenames[shard_idx], model_desc)
+        needed = val_target - total_val
+        val_tokens.extend(tokens[:needed])
+        total_val += len(tokens[:needed])
+        shard_idx += 1
     write_datafile(os.path.join(DATA_CACHE_DIR, "TinyStories_val.bin"), val_tokens, model_desc)
     print(f"Val: wrote {len(val_tokens):,} tokens")
 
-    # TRAIN split (95%)
+    # TRAIN split (95%) - continue from where val stopped
     print("Tokenizing train split...")
     train_tokens = []
     total_train = 0
-    for shard_index in range(shard_index + 1, len(shard_filenames)):
-        shard_filename = shard_filenames[shard_index]
-        tokens = process_shard(shard_index, shard_filename, model_desc)
-        train_tokens.extend(tokens)
-        total_train += len(tokens)
+    for s in range(shard_idx, len(shard_filenames)):
+        tokens = process_shard(s, shard_filenames[s], model_desc)
+        needed = train_target - total_train
+        train_tokens.extend(tokens[:needed])
+        total_train += len(tokens[:needed])
         if total_train >= train_target:
             break
     write_datafile(os.path.join(DATA_CACHE_DIR, "TinyStories_train.bin"), train_tokens, model_desc)
