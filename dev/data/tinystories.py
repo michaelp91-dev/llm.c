@@ -95,21 +95,25 @@ def process_shard(shard_index, shard_filename, model_desc):
         all_tokens.extend(tokens)
     return all_tokens
 
-def tokenize(model_desc):
-    # shard 0 will be the val split, rest is train
+def tokenize(model_desc, max_tokens=None):
     data_dir = os.path.join(DATA_CACHE_DIR, "TinyStories_all_data")
     shard_filenames = sorted(glob.glob(os.path.join(data_dir, "*.json")))
     val_shards = [shard_filenames[0]]
     train_shards = shard_filenames[1:]
-    for split_name, split_shards in [("val", val_shards), ("train", train_shards)]:
 
+    for split_name, split_shards in [("val", val_shards), ("train", train_shards)]:
         print(f"Tokenizing {split_name} split...")
         all_tokens = []
-        with ProcessPoolExecutor() as executor:
-            futures = [executor.submit(process_shard, shard_index, shard_filename, model_desc)
-                       for shard_index, shard_filename in enumerate(split_shards)]
-            for future in as_completed(futures):
-                all_tokens.extend(future.result())
+        total_tokens = 0
+
+        for shard_index, shard_filename in enumerate(split_shards):
+            tokens = process_shard(shard_index, shard_filename, model_desc)
+            all_tokens.extend(tokens)
+            total_tokens += len(tokens)
+
+            if split_name == "train" and max_tokens is not None and total_tokens >= max_tokens:
+                print(f"Reached {max_tokens} tokens, stopping early")
+                break
 
         split_filename = os.path.join(DATA_CACHE_DIR, f"TinyStories_{split_name}.bin")
         write_datafile(split_filename, all_tokens, model_desc)
@@ -117,6 +121,7 @@ def tokenize(model_desc):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Tiny Stories dataset preprocessing")
     parser.add_argument("-m", "--model_desc", type=str, default="gpt-2", choices=["gpt-2", "llama-3"], help="Model type, gpt-2|llama-3")
+    parser.add_argument("--max-tokens", type=int, default=None, help="Stop train split after this many tokens (None = all)")
     args = parser.parse_args()
     download()
-    tokenize(args.model_desc)
+    tokenize(args.model_desc, args.max_tokens)
