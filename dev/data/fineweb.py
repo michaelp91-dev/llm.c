@@ -74,7 +74,7 @@ for example in tqdm(fw):
         total_val += len(tokens[:needed])
         tokens = tokens[needed:]
 
-    if total_train < train_target and tokens:
+    if total_train < train_target and len(tokens) > 0:
         needed = train_target - total_train
         train_tokens.extend(tokens[:needed])
         total_train += len(tokens[:needed])
