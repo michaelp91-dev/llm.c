@@ -1,84 +1,80 @@
-"""
-FineWeb / FineWeb-Edu - crash-proof version for Colab
-Only downloads exactly the tokens you need (95/5 split)
-"""
-
 import argparse
+import subprocess
 import os
-import numpy as np
-import tiktoken
-from datasets import load_dataset
-from transformers import AutoTokenizer
+import shutil
 
-from data_common import write_datafile
-
-parser = argparse.ArgumentParser()
-parser.add_argument("-t", "--type", type=str, default="classic", choices=["classic", "edu"])
-parser.add_argument("-v", "--version", type=str, default="10B", choices=["10B", "100B"])
-parser.add_argument("-m", "--model_desc", type=str, default="gpt-2", choices=["gpt-2", "llama-3"])
-parser.add_argument("--max-tokens", type=int, default=None)
+parser = argparse.ArgumentParser(description="Prepare single or mixed dataset for llm.c training")
+parser.add_argument("--max-tokens", type=int, default=None, help="Total tokens for train+val (95% train, 5% val)")
+parser.add_argument("--mix", type=str, required=True,
+                    help="Mixture like 'fineweb:0.5,tinyshakespeare:0.3,tinystories:0.2'")
 args = parser.parse_args()
-
-local_dir, remote_name = {
-    ("classic", "10B"): ("fineweb10B", "sample-10BT"),
-    ("classic", "100B"): ("fineweb100B", "sample-100BT"),
-    ("edu", "10B"): ("edu_fineweb10B", "sample-10BT"),
-    ("edu", "100B"): ("edu_fineweb100B", "sample-100BT")
-}[(args.type, args.version)]
-
-DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
-os.makedirs(DATA_CACHE_DIR, exist_ok=True)
 
 if args.max_tokens is None:
     args.max_tokens = 1_000_000_000_000
 
-val_target = int(args.max_tokens * 0.05)
-train_target = args.max_tokens - val_target
+# Parse mixture
+parts = [p.strip() for p in args.mix.split(",")]
+sources = {}
+for p in parts:
+    name, ratio_str = p.split(":")
+    sources[name] = float(ratio_str)
 
-print(f"Target split: {train_target:,} train + {val_target:,} val = {args.max_tokens:,} total")
+# Normalize ratios
+total = sum(sources.values())
+for k in sources:
+    sources[k] /= total
 
-fw = load_dataset(
-    "HuggingFaceFW/fineweb" if args.type == "classic" else "HuggingFaceFW/fineweb-edu",
-    name=remote_name, 
-    split="train", 
-    streaming=True
-)
+DATA_DIR = "dev/data"
+MIX_DIR = os.path.join(DATA_DIR, "mixed")
+os.makedirs(MIX_DIR, exist_ok=True)
 
-def tokenize(doc):
-    if args.model_desc == "gpt-2":
-        enc = tiktoken.get_encoding("gpt2")
-        tokens = [enc._special_tokens['<|endoftext|>']] + enc.encode_ordinary(doc["text"])
-        return np.array(tokens, dtype=np.uint16)
-    else:
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
-        tokens = [tokenizer.encode('')[0]] + tokenizer.encode(doc["text"], add_special_tokens=False, verbose=False, split_special_tokens=True)
-        return np.array(tokens, dtype=np.uint32)
+print(f"Preparing mixture: {sources}")
+print(f"Total tokens: {args.max_tokens:,}\n")
 
-val_tokens = []
-train_tokens = []
-total_val = 0
-total_train = 0
+train_files = []
+val_files = []
 
-print("Tokenizing (streaming - only downloading what we need)...")
-for example in fw:
-    tokens = tokenize(example)
+for name, ratio in sources.items():
+    tokens = int(args.max_tokens * ratio)
+    print(f"→ {name}: {tokens:,} tokens ({ratio*100:.1f}%)")
 
-    if total_val < val_target:
-        needed = val_target - total_val
-        val_tokens.extend(tokens[:needed])
-        total_val += len(tokens[:needed])
-        tokens = tokens[needed:]
+    if name == "tinystories":
+        cmd = ["python", f"{DATA_DIR}/tinystories.py", "--max-tokens", str(tokens)]
+        train_path = f"{DATA_DIR}/tinystories/TinyStories_train.bin"
+        val_path   = f"{DATA_DIR}/tinystories/TinyStories_val.bin"
+    elif name == "tinyshakespeare":
+        cmd = ["python", f"{DATA_DIR}/tinyshakespeare.py", "--max-tokens", str(tokens)]
+        train_path = f"{DATA_DIR}/tinyshakespeare/tiny_shakespeare_train.bin"
+        val_path   = f"{DATA_DIR}/tinyshakespeare/tiny_shakespeare_val.bin"
+    elif name == "fineweb":
+        cmd = ["python", f"{DATA_DIR}/fineweb.py", "--max-tokens", str(tokens)]
+        train_path = f"{DATA_DIR}/fineweb10B/fineweb10B_train_000000.bin"
+        val_path   = f"{DATA_DIR}/fineweb10B/fineweb10B_val_000000.bin"
 
-    if total_train < train_target and len(tokens) > 0:
-        needed = train_target - total_train
-        train_tokens.extend(tokens[:needed])
-        total_train += len(tokens[:needed])
+    subprocess.run(cmd, check=True)
 
-    if total_val >= val_target and total_train >= train_target:
-        break
+    train_files.append(train_path)
+    val_files.append(val_path)
 
-write_datafile(os.path.join(DATA_CACHE_DIR, f"{local_dir}_val_000000.bin"), val_tokens, args.model_desc)
-write_datafile(os.path.join(DATA_CACHE_DIR, f"{local_dir}_train_000000.bin"), train_tokens, args.model_desc)
+# Concatenate into final mixed files
+final_train = os.path.join(MIX_DIR, "train.bin")
+final_val   = os.path.join(MIX_DIR, "val.bin")
 
-print(f"Val: wrote {len(val_tokens):,} tokens")
-print(f"Train: wrote {len(train_tokens):,} tokens")
+print("\nConcatenating all files into final train.bin and val.bin...")
+
+with open(final_train, "wb") as f:
+    for path in train_files:
+        with open(path, "rb") as src:
+            shutil.copyfileobj(src, f)
+
+with open(final_val, "wb") as f:
+    for path in val_files:
+        with open(path, "rb") as src:
+            shutil.copyfileobj(src, f)
+
+print(f"\n✅ Done!")
+print(f"Final train.bin: {os.path.getsize(final_train)/1_048_576:.1f} MB")
+print(f"Final val.bin:   {os.path.getsize(final_val)/1_048_576:.1f} MB")
+print(f"\nFiles saved to: {MIX_DIR}/")
+print("\nYou can now train with:")
+print(f"./train_gpt2fp32cu -i {MIX_DIR}/train.bin -j {MIX_DIR}/val.bin -t 512 -s 50")
