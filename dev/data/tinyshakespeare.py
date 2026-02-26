@@ -1,5 +1,6 @@
 import argparse
 import os
+import urllib.request
 
 import tiktoken
 from transformers import AutoTokenizer
@@ -10,11 +11,10 @@ DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), "tinyshakespeare")
 
 def download():
     os.makedirs(DATA_CACHE_DIR, exist_ok=True)
-    data_url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
-    data_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare.txt")
-    if not os.path.exists(data_filename):
-        import urllib.request
-        urllib.request.urlretrieve(data_url, data_filename)
+    url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+    filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare.txt")
+    if not os.path.exists(filename):
+        urllib.request.urlretrieve(url, filename)
 
 def tokenize(model_desc, max_tokens=None):
     if max_tokens is None:
@@ -42,14 +42,13 @@ def tokenize(model_desc, max_tokens=None):
         tokens.append(eot)
         tokens.extend(encode(s))
 
-    # val 5%
     val_tokens = tokens[:val_target]
-    write_datafile(os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_val.bin"), val_tokens, model_desc)
-    print(f"Val: wrote {len(val_tokens):,} tokens")
-
-    # train 95%
     train_tokens = tokens[val_target:val_target + train_target]
+
+    write_datafile(os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_val.bin"), val_tokens, model_desc)
     write_datafile(os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_train.bin"), train_tokens, model_desc)
+
+    print(f"Val: wrote {len(val_tokens):,} tokens")
     print(f"Train: wrote {len(train_tokens):,} tokens")
 
 if __name__ == "__main__":
