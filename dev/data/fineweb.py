@@ -1,8 +1,3 @@
-"""
-FineWeb / FineWeb-Edu with --max-tokens support (95% train / 5% val)
-Only downloads exactly what you need.
-"""
-
 import argparse
 import os
 import numpy as np
@@ -14,17 +9,12 @@ from data_common import write_datafile
 
 parser = argparse.ArgumentParser()
 parser.add_argument("-t", "--type", type=str, default="classic", choices=["classic", "edu"])
-parser.add_argument("-v", "--version", type=str, default="10B", choices=["10B", "100B"])
 parser.add_argument("-m", "--model_desc", type=str, default="gpt-2", choices=["gpt-2", "llama-3"])
 parser.add_argument("--max-tokens", type=int, default=None)
 args = parser.parse_args()
 
-local_dir, remote_name = {
-    ("classic", "10B"): ("fineweb10B", "sample-10BT"),
-    ("classic", "100B"): ("fineweb100B", "sample-100BT"),
-    ("edu", "10B"): ("edu_fineweb10B", "sample-10BT"),
-    ("edu", "100B"): ("edu_fineweb100B", "sample-100BT")
-}[(args.type, args.version)]
+local_dir = "fineweb10B" if args.type == "classic" else "edu_fineweb10B"
+remote_name = "sample-10BT"
 
 DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
 os.makedirs(DATA_CACHE_DIR, exist_ok=True)
@@ -37,12 +27,8 @@ train_target = args.max_tokens - val_target
 
 print(f"Target split: {train_target:,} train + {val_target:,} val = {args.max_tokens:,} total")
 
-fw = load_dataset(
-    "HuggingFaceFW/fineweb" if args.type == "classic" else "HuggingFaceFW/fineweb-edu",
-    name=remote_name,
-    split="train",
-    streaming=True
-)
+fw = load_dataset("HuggingFaceFW/fineweb" if args.type == "classic" else "HuggingFaceFW/fineweb-edu",
+                  name=remote_name, split="train", streaming=True)
 
 def tokenize(doc):
     if args.model_desc == "gpt-2":
@@ -58,14 +44,10 @@ val_tokens = []
 train_tokens = []
 total_val = 0
 total_train = 0
-count = 0
 
-print("Tokenizing (streaming mode - only downloading needed data)...")
+print("Tokenizing (streaming - only downloading needed data)...")
 for example in fw:
     tokens = tokenize(example)
-    count += 1
-    if count % 1000 == 0:
-        print(f"Processed {count:,} examples...")
 
     if total_val < val_target:
         needed = val_target - total_val
