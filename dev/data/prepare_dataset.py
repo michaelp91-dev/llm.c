@@ -2,8 +2,9 @@ import argparse
 import subprocess
 import os
 import shutil
+import struct
 
-parser = argparse.ArgumentParser()
+parser = argparse.ArgumentParser(description="Prepare mixed dataset for llm.c")
 parser.add_argument("--max-tokens", type=int, default=None)
 parser.add_argument("--mix", type=str, required=True,
                     help="Mixture like 'fineweb:0.5,tinyshakespeare:0.3,tinystories:0.2'")
@@ -12,12 +13,14 @@ args = parser.parse_args()
 if args.max_tokens is None:
     args.max_tokens = 1_000_000_000_000
 
+# Parse mixture
 parts = [p.strip() for p in args.mix.split(",")]
 sources = {}
 for p in parts:
     name, ratio_str = p.split(":")
     sources[name] = float(ratio_str)
 
+# Normalize
 total = sum(sources.values())
 for k in sources:
     sources[k] /= total
@@ -29,8 +32,8 @@ os.makedirs(MIX_DIR, exist_ok=True)
 print(f"Preparing mixture: {sources}")
 print(f"Total tokens: {args.max_tokens:,}\n")
 
-train_files = []
-val_files = []
+train_paths = []
+val_paths = []
 
 for name, ratio in sources.items():
     tokens = int(args.max_tokens * ratio)
@@ -51,26 +54,31 @@ for name, ratio in sources.items():
 
     subprocess.run(cmd, check=True)
 
-    train_files.append(train_path)
-    val_files.append(val_path)
+    train_paths.append(train_path)
+    val_paths.append(val_path)
 
-# Concatenate
 final_train = os.path.join(MIX_DIR, "train.bin")
 final_val   = os.path.join(MIX_DIR, "val.bin")
 
-print("\nConcatenating into final train.bin and val.bin...")
+def concat_bin_files(output_path, input_paths):
+    all_tokens = bytearray()
+    for path in input_paths:
+        with open(path, "rb") as f:
+            f.read(8)  # skip the 8-byte header
+            all_tokens.extend(f.read())
+    total_tokens = len(all_tokens) // 2   # uint16 tokens
 
-with open(final_train, "wb") as f:
-    for path in train_files:
-        with open(path, "rb") as src:
-            shutil.copyfileobj(src, f)
+    with open(output_path, "wb") as f:
+        f.write(struct.pack("<Q", total_tokens))  # write correct header
+        f.write(all_tokens)
 
-with open(final_val, "wb") as f:
-    for path in val_files:
-        with open(path, "rb") as src:
-            shutil.copyfileobj(src, f)
+print("\nConcatenating with correct header...")
+
+concat_bin_files(final_train, train_paths)
+concat_bin_files(final_val, val_paths)
 
 print(f"\n✅ Success!")
 print(f"Final train.bin: {os.path.getsize(final_train)/1_048_576:.1f} MB")
 print(f"Final val.bin:   {os.path.getsize(final_val)/1_048_576:.1f} MB")
-print(f"\nFiles are in: {MIX_DIR}/")
+print(f"\nReady to train:")
+print(f"./train_gpt2fp32cu -i {MIX_DIR}/train.bin -j {MIX_DIR}/val.bin -t 512 -s 50")
