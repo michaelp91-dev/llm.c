@@ -20,7 +20,6 @@ for p in parts:
     name, ratio_str = p.split(":")
     sources[name] = float(ratio_str)
 
-# Normalize
 total = sum(sources.values())
 for k in sources:
     sources[k] /= total
@@ -32,8 +31,8 @@ os.makedirs(MIX_DIR, exist_ok=True)
 print(f"Preparing mixture: {sources}")
 print(f"Total tokens: {args.max_tokens:,}\n")
 
-train_paths = []
-val_paths = []
+all_train = bytearray()
+all_val = bytearray()
 
 for name, ratio in sources.items():
     tokens = int(args.max_tokens * ratio)
@@ -54,31 +53,30 @@ for name, ratio in sources.items():
 
     subprocess.run(cmd, check=True)
 
-    train_paths.append(train_path)
-    val_paths.append(val_path)
+    # Read raw tokens, skip the 8-byte header
+    with open(train_path, "rb") as f:
+        f.read(8)                    # skip header
+        all_train.extend(f.read())
 
+    with open(val_path, "rb") as f:
+        f.read(8)
+        all_val.extend(f.read())
+
+# Write final files with correct llm.c header
 final_train = os.path.join(MIX_DIR, "train.bin")
 final_val   = os.path.join(MIX_DIR, "val.bin")
 
-def concat_bin_files(output_path, input_paths):
-    all_tokens = bytearray()
-    for path in input_paths:
-        with open(path, "rb") as f:
-            f.read(8)  # skip the 8-byte header
-            all_tokens.extend(f.read())
-    total_tokens = len(all_tokens) // 2   # uint16 tokens
+def write_bin(path, data):
+    num_tokens = len(data) // 2   # GPT-2 uses uint16
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", num_tokens))  # correct header
+        f.write(data)
 
-    with open(output_path, "wb") as f:
-        f.write(struct.pack("<Q", total_tokens))  # write correct header
-        f.write(all_tokens)
+write_bin(final_train, all_train)
+write_bin(final_val, all_val)
 
-print("\nConcatenating with correct header...")
-
-concat_bin_files(final_train, train_paths)
-concat_bin_files(final_val, val_paths)
-
-print(f"\n✅ Success!")
+print(f"\n✅ Done!")
 print(f"Final train.bin: {os.path.getsize(final_train)/1_048_576:.1f} MB")
 print(f"Final val.bin:   {os.path.getsize(final_val)/1_048_576:.1f} MB")
-print(f"\nReady to train:")
+print(f"\nTrain with:")
 print(f"./train_gpt2fp32cu -i {MIX_DIR}/train.bin -j {MIX_DIR}/val.bin -t 512 -s 50")
