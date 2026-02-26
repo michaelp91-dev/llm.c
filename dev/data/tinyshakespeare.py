@@ -13,12 +13,18 @@ def download():
     data_url = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
     data_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare.txt")
     if not os.path.exists(data_filename):
-        print(f"Downloading {data_url}...")
         import urllib.request
         urllib.request.urlretrieve(data_url, data_filename)
 
 def tokenize(model_desc, max_tokens=None):
-    download()
+    if max_tokens is None:
+        max_tokens = 1_000_000_000_000
+
+    val_target = int(max_tokens * 0.05)
+    train_target = max_tokens - val_target
+
+    print(f"Target split: {train_target:,} train + {val_target:,} val = {max_tokens:,} total")
+
     data_filename = os.path.join(DATA_CACHE_DIR, "tiny_shakespeare.txt")
     text = open(data_filename, 'r').read()
 
@@ -26,28 +32,24 @@ def tokenize(model_desc, max_tokens=None):
         enc = tiktoken.get_encoding("gpt2")
         encode = lambda s: enc.encode_ordinary(s)
         eot = enc._special_tokens['<|endoftext|>']
-    elif model_desc == "llama-3":
+    else:
         tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
         encode = lambda s: tokenizer.encode(s, add_special_tokens=False, verbose=False, split_special_tokens=True)
         eot = tokenizer.encode('')[0]
 
-    sections = text.split("\n\n")
     tokens = []
-    for s in sections:
+    for s in text.split("\n\n"):
         tokens.append(eot)
-        tokens.extend(encode(s + "\n\n"))
+        tokens.extend(encode(s))
 
-    if max_tokens is None:
-        max_tokens = len(tokens)
-
-    val_target = int(max_tokens * 0.05)
+    # val 5%
     val_tokens = tokens[:val_target]
-    train_tokens = tokens[val_target:max_tokens]
-
     write_datafile(os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_val.bin"), val_tokens, model_desc)
-    write_datafile(os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_train.bin"), train_tokens, model_desc)
-
     print(f"Val: wrote {len(val_tokens):,} tokens")
+
+    # train 95%
+    train_tokens = tokens[val_target:val_target + train_target]
+    write_datafile(os.path.join(DATA_CACHE_DIR, "tiny_shakespeare_train.bin"), train_tokens, model_desc)
     print(f"Train: wrote {len(train_tokens):,} tokens")
 
 if __name__ == "__main__":
@@ -55,4 +57,5 @@ if __name__ == "__main__":
     parser.add_argument("-m", "--model_desc", type=str, default="gpt-2", choices=["gpt-2", "llama-3"])
     parser.add_argument("--max-tokens", type=int, default=None)
     args = parser.parse_args()
+    download()
     tokenize(args.model_desc, args.max_tokens)
