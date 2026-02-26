@@ -1,6 +1,6 @@
 """
 FineWeb / FineWeb-Edu with --max-tokens support (95% train / 5% val)
-Only downloads and tokenizes exactly what you need.
+Only downloads exactly what you need.
 """
 
 import argparse
@@ -8,7 +8,6 @@ import os
 import numpy as np
 import tiktoken
 from datasets import load_dataset
-from tqdm import tqdm
 from transformers import AutoTokenizer
 
 from data_common import write_datafile
@@ -38,7 +37,6 @@ train_target = args.max_tokens - val_target
 
 print(f"Target split: {train_target:,} train + {val_target:,} val = {args.max_tokens:,} total")
 
-# Streaming = only downloads what we need
 fw = load_dataset(
     "HuggingFaceFW/fineweb" if args.type == "classic" else "HuggingFaceFW/fineweb-edu",
     name=remote_name,
@@ -60,10 +58,14 @@ val_tokens = []
 train_tokens = []
 total_val = 0
 total_train = 0
+count = 0
 
 print("Tokenizing (streaming mode - only downloading needed data)...")
-for example in tqdm(fw):
+for example in fw:
     tokens = tokenize(example)
+    count += 1
+    if count % 1000 == 0:
+        print(f"Processed {count:,} examples...")
 
     if total_val < val_target:
         needed = val_target - total_val
@@ -79,7 +81,6 @@ for example in tqdm(fw):
     if total_val >= val_target and total_train >= train_target:
         break
 
-# Write files
 write_datafile(os.path.join(DATA_CACHE_DIR, f"{local_dir}_val_000000.bin"), val_tokens, args.model_desc)
 write_datafile(os.path.join(DATA_CACHE_DIR, f"{local_dir}_train_000000.bin"), train_tokens, args.model_desc)
 
