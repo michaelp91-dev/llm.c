@@ -3,8 +3,8 @@ import subprocess
 import os
 import shutil
 
-parser = argparse.ArgumentParser(description="Prepare single or mixed dataset for llm.c training")
-parser.add_argument("--max-tokens", type=int, default=None, help="Total tokens for train+val (95% train, 5% val)")
+parser = argparse.ArgumentParser()
+parser.add_argument("--max-tokens", type=int, default=None)
 parser.add_argument("--mix", type=str, required=True,
                     help="Mixture like 'fineweb:0.5,tinyshakespeare:0.3,tinystories:0.2'")
 args = parser.parse_args()
@@ -12,14 +12,12 @@ args = parser.parse_args()
 if args.max_tokens is None:
     args.max_tokens = 1_000_000_000_000
 
-# Parse mixture
 parts = [p.strip() for p in args.mix.split(",")]
 sources = {}
 for p in parts:
     name, ratio_str = p.split(":")
     sources[name] = float(ratio_str)
 
-# Normalize ratios
 total = sum(sources.values())
 for k in sources:
     sources[k] /= total
@@ -56,11 +54,11 @@ for name, ratio in sources.items():
     train_files.append(train_path)
     val_files.append(val_path)
 
-# Concatenate into final mixed files
+# Concatenate
 final_train = os.path.join(MIX_DIR, "train.bin")
 final_val   = os.path.join(MIX_DIR, "val.bin")
 
-print("\nConcatenating all files into final train.bin and val.bin...")
+print("\nConcatenating into final train.bin and val.bin...")
 
 with open(final_train, "wb") as f:
     for path in train_files:
@@ -72,9 +70,7 @@ with open(final_val, "wb") as f:
         with open(path, "rb") as src:
             shutil.copyfileobj(src, f)
 
-print(f"\n✅ Done!")
+print(f"\n✅ Success!")
 print(f"Final train.bin: {os.path.getsize(final_train)/1_048_576:.1f} MB")
 print(f"Final val.bin:   {os.path.getsize(final_val)/1_048_576:.1f} MB")
-print(f"\nFiles saved to: {MIX_DIR}/")
-print("\nYou can now train with:")
-print(f"./train_gpt2fp32cu -i {MIX_DIR}/train.bin -j {MIX_DIR}/val.bin -t 512 -s 50")
+print(f"\nFiles are in: {MIX_DIR}/")
