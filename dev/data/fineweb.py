@@ -1,11 +1,10 @@
 """
-FineWeb dataset preprocessing with --max-tokens support (95% train / 5% val)
+FineWeb / FineWeb-Edu with --max-tokens support (95% train / 5% val)
+Only downloads and tokenizes exactly what you need.
 """
 
 import argparse
 import os
-import multiprocessing as mp
-
 import numpy as np
 import tiktoken
 from datasets import load_dataset
@@ -39,32 +38,30 @@ train_target = args.max_tokens - val_target
 
 print(f"Target split: {train_target:,} train + {val_target:,} val = {args.max_tokens:,} total")
 
-# Use streaming to only download what we need
-fw = load_dataset("HuggingFaceFW/fineweb" if args.type == "classic" else "HuggingFaceFW/fineweb-edu",
-                  name=remote_name, split="train", streaming=True)
+# Streaming = only downloads what we need
+fw = load_dataset(
+    "HuggingFaceFW/fineweb" if args.type == "classic" else "HuggingFaceFW/fineweb-edu",
+    name=remote_name,
+    split="train",
+    streaming=True
+)
 
-def tokenize_gpt2(doc):
-    enc = tiktoken.get_encoding("gpt2")
-    encode = lambda s: enc.encode_ordinary(s)
-    eot = enc._special_tokens['<|endoftext|>']
-    tokens = [eot] + encode(doc["text"])
-    return np.array(tokens, dtype=np.uint16)
-
-def tokenize_llama(doc):
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
-    encode = lambda s: tokenizer.encode(s, add_special_tokens=False, verbose=False, split_special_tokens=True)
-    eot = tokenizer.encode('')[0]
-    tokens = [eot] + encode(doc["text"])
-    return np.array(tokens, dtype=np.uint32)
-
-tokenize = tokenize_gpt2 if args.model_desc == "gpt-2" else tokenize_llama
+def tokenize(doc):
+    if args.model_desc == "gpt-2":
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = [enc._special_tokens['<|endoftext|>']] + enc.encode_ordinary(doc["text"])
+        return np.array(tokens, dtype=np.uint16)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+        tokens = [tokenizer.encode('')[0]] + tokenizer.encode(doc["text"], add_special_tokens=False, verbose=False, split_special_tokens=True)
+        return np.array(tokens, dtype=np.uint32)
 
 val_tokens = []
 train_tokens = []
 total_val = 0
 total_train = 0
 
-print("Tokenizing (streaming - only downloading needed data)...")
+print("Tokenizing (streaming mode - only downloading needed data)...")
 for example in tqdm(fw):
     tokens = tokenize(example)
 
@@ -82,6 +79,7 @@ for example in tqdm(fw):
     if total_val >= val_target and total_train >= train_target:
         break
 
+# Write files
 write_datafile(os.path.join(DATA_CACHE_DIR, f"{local_dir}_val_000000.bin"), val_tokens, args.model_desc)
 write_datafile(os.path.join(DATA_CACHE_DIR, f"{local_dir}_train_000000.bin"), train_tokens, args.model_desc)
 
