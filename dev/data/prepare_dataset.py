@@ -20,6 +20,7 @@ for p in parts:
     name, ratio_str = p.split(":")
     sources[name] = float(ratio_str)
 
+# Normalize ratios
 total = sum(sources.values())
 for k in sources:
     sources[k] /= total
@@ -53,21 +54,21 @@ for name, ratio in sources.items():
 
     subprocess.run(cmd, check=True)
 
-    # Read raw tokens, skip the 8-byte header
+    # Skip the 8-byte header and append raw token data
     with open(train_path, "rb") as f:
-        f.read(8)                    # skip header
+        f.read(8)  # skip header
         all_train.extend(f.read())
 
     with open(val_path, "rb") as f:
         f.read(8)
         all_val.extend(f.read())
 
-# Write final files with correct llm.c header
+# Write final files with correct header
 final_train = os.path.join(MIX_DIR, "train.bin")
 final_val   = os.path.join(MIX_DIR, "val.bin")
 
 def write_bin(path, data):
-    num_tokens = len(data) // 2   # GPT-2 uses uint16
+    num_tokens = len(data) // 2
     with open(path, "wb") as f:
         f.write(struct.pack("<Q", num_tokens))  # correct header
         f.write(data)
@@ -78,5 +79,6 @@ write_bin(final_val, all_val)
 print(f"\n✅ Done!")
 print(f"Final train.bin: {os.path.getsize(final_train)/1_048_576:.1f} MB")
 print(f"Final val.bin:   {os.path.getsize(final_val)/1_048_576:.1f} MB")
+print(f"\nFiles saved to: {MIX_DIR}/")
 print(f"\nTrain with:")
 print(f"./train_gpt2fp32cu -i {MIX_DIR}/train.bin -j {MIX_DIR}/val.bin -t 512 -s 50")
