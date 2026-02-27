@@ -1,5 +1,6 @@
 import argparse
 import os
+os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 import numpy as np
 import tiktoken
 from datasets import load_dataset
