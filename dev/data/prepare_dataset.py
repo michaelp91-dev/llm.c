@@ -40,20 +40,21 @@ for name, ratio in sources.items():
     if name == "tinystories":
         cmd = ["python", f"{DATA_DIR}/tinystories.py", "--max-tokens", str(tokens)]
         train_path = f"{DATA_DIR}/tinystories/TinyStories_train.bin"
-        val_path = f"{DATA_DIR}/tinystories/TinyStories_val.bin"
+        val_path   = f"{DATA_DIR}/tinystories/TinyStories_val.bin"
     elif name == "tinyshakespeare":
         cmd = ["python", f"{DATA_DIR}/tinyshakespeare.py", "--max-tokens", str(tokens)]
         train_path = f"{DATA_DIR}/tinyshakespeare/tiny_shakespeare_train.bin"
-        val_path = f"{DATA_DIR}/tinyshakespeare/tiny_shakespeare_val.bin"
+        val_path   = f"{DATA_DIR}/tinyshakespeare/tiny_shakespeare_val.bin"
     elif name == "fineweb":
         cmd = ["python", f"{DATA_DIR}/fineweb.py", "--max-tokens", str(tokens)]
         train_path = f"{DATA_DIR}/fineweb10B/fineweb10B_train_000000.bin"
-        val_path = f"{DATA_DIR}/fineweb10B/fineweb10B_val_000000.bin"
+        val_path   = f"{DATA_DIR}/fineweb10B/fineweb10B_val_000000.bin"
 
     subprocess.run(cmd, check=True)
 
+    # Skip the old 8-byte header and take raw token data
     with open(train_path, "rb") as f:
-        f.read(8)   # skip old header
+        f.read(8)
         all_train.extend(f.read())
 
     with open(val_path, "rb") as f:
@@ -65,10 +66,12 @@ final_val   = os.path.join(MIX_DIR, "val.bin")
 
 def write_bin(path, data):
     num_tokens = len(data) // 2
+    header = [0] * 256
+    header[0] = 20240520   # magic
+    header[1] = 1          # version
+    header[2] = num_tokens # ntok
     with open(path, "wb") as f:
-        f.write(struct.pack("<I", 20240520))  # magic
-        f.write(struct.pack("<I", 1))         # version
-        f.write(struct.pack("<Q", num_tokens)) # ntok
+        f.write(struct.pack("<256I", *header))   # full 1024-byte header
         f.write(data)
 
 write_bin(final_train, all_train)
@@ -78,5 +81,5 @@ print(f"\n✅ Done!")
 print(f"Final train.bin: {os.path.getsize(final_train)/1_048_576:.1f} MB")
 print(f"Final val.bin:   {os.path.getsize(final_val)/1_048_576:.1f} MB")
 print(f"\nFiles saved to: {MIX_DIR}/")
-print(f"\nTrain with:")
+print(f"\nNow train with:")
 print(f"./train_gpt2fp32cu -i {MIX_DIR}/train.bin -j {MIX_DIR}/val.bin -t 512 -s 50")
