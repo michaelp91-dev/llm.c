@@ -52,25 +52,23 @@ for name, ratio in sources.items():
 
     subprocess.run(cmd, check=True)
 
-    # Skip old header and append raw tokens
     with open(train_path, "rb") as f:
-        f.read(8)  # skip old header
+        f.read(8)   # skip old header
         all_train.extend(f.read())
 
     with open(val_path, "rb") as f:
         f.read(8)
         all_val.extend(f.read())
 
-# Write final files with correct llm.c header
 final_train = os.path.join(MIX_DIR, "train.bin")
 final_val   = os.path.join(MIX_DIR, "val.bin")
 
 def write_bin(path, data):
     num_tokens = len(data) // 2
     with open(path, "wb") as f:
-        f.write(struct.pack("<I", 20240520))   # magic number
-        f.write(struct.pack("<I", 1))          # version
-        f.write(struct.pack("<Q", num_tokens)) # number of tokens
+        f.write(struct.pack("<I", 20240520))  # magic
+        f.write(struct.pack("<I", 1))         # version
+        f.write(struct.pack("<Q", num_tokens)) # ntok
         f.write(data)
 
 write_bin(final_train, all_train)
@@ -80,5 +78,5 @@ print(f"\n✅ Done!")
 print(f"Final train.bin: {os.path.getsize(final_train)/1_048_576:.1f} MB")
 print(f"Final val.bin:   {os.path.getsize(final_val)/1_048_576:.1f} MB")
 print(f"\nFiles saved to: {MIX_DIR}/")
-print(f"\nNow train with:")
+print(f"\nTrain with:")
 print(f"./train_gpt2fp32cu -i {MIX_DIR}/train.bin -j {MIX_DIR}/val.bin -t 512 -s 50")
