@@ -1,6 +1,7 @@
 import argparse
 import os
 os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 import numpy as np
 import tiktoken
 from datasets import load_dataset
@@ -31,13 +32,15 @@ print(f"Target split: {train_target:,} train + {val_target:,} val = {args.max_to
 fw = load_dataset("HuggingFaceFW/fineweb" if args.type == "classic" else "HuggingFaceFW/fineweb-edu",
                   name=remote_name, split="train", streaming=True)
 
+if args.model_desc == "llama-3":
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
+
 def tokenize(doc):
     if args.model_desc == "gpt-2":
         enc = tiktoken.get_encoding("gpt2")
         tokens = [enc._special_tokens['<|endoftext|>']] + enc.encode_ordinary(doc["text"])
         return np.array(tokens, dtype=np.uint16)
     else:
-        tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3.1-8B")
         tokens = [tokenizer.encode('')[0]] + tokenizer.encode(doc["text"], add_special_tokens=False, verbose=False, split_special_tokens=True)
         return np.array(tokens, dtype=np.uint32)
 
