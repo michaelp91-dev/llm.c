@@ -1630,6 +1630,7 @@ int main(int argc, char *argv[]) {
 	    if (model_size == 15) checkpoint_file = "gpt2_15M.bin";
 	    else if (model_size == 30) checkpoint_file = "gpt2_30M.bin";
 	    else if (model_size == 70) checkpoint_file = "gpt2_70M.bin";
+		else if (model_size == 135) checkpoint_file = "gpt2_135M.bin";
 	}
     GPT2 model;
     gpt2_build_from_checkpoint(&model, checkpoint_file);
