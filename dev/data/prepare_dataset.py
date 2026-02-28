@@ -2,84 +2,97 @@ import argparse
 import subprocess
 import os
 import struct
+from datasets import load_dataset
+import tiktoken
 
-parser = argparse.ArgumentParser(description="Prepare mixed dataset for llm.c")
-parser.add_argument("--max-tokens", type=int, default=None)
-parser.add_argument("--mix", type=str, required=True,
-                    help="Mixture like 'fineweb:0.5,tinyshakespeare:0.3,tinystories:0.2'")
+parser = argparse.ArgumentParser()
+parser.add_argument("--max-tokens", type=int, default=10_000_000_000)
+parser.add_argument("--mix", type=str, required=True, help="e.g. fineweb:0.6,tinystories:0.25,conversational:0.1,code:0.05")
 args = parser.parse_args()
 
-if args.max_tokens is None:
-    args.max_tokens = 1_000_000_000_000
+DATA_DIR = "dev/data"
+MIX_DIR = f"{DATA_DIR}/mixed"
+os.makedirs(MIX_DIR, exist_ok=True)
 
-# Parse mixture
 parts = [p.strip() for p in args.mix.split(",")]
 sources = {}
 for p in parts:
-    name, ratio_str = p.split(":")
-    sources[name] = float(ratio_str)
+    name, ratio = p.split(":")
+    sources[name] = float(ratio)
 
 total = sum(sources.values())
 for k in sources:
     sources[k] /= total
 
-DATA_DIR = "dev/data"
-MIX_DIR = os.path.join(DATA_DIR, "mixed")
-os.makedirs(MIX_DIR, exist_ok=True)
-
-print(f"Preparing mixture: {sources}")
-print(f"Total tokens: {args.max_tokens:,}\n")
+print("Preparing mixture for 135M NanoGrok:", sources)
+print("Total tokens:", args.max_tokens)
 
 all_train = bytearray()
 all_val = bytearray()
 
+enc = tiktoken.get_encoding("gpt2")
+
 for name, ratio in sources.items():
-    tokens = int(args.max_tokens * ratio)
-    print(f"→ {name}: {tokens:,} tokens ({ratio*100:.1f}%)")
+    tokens_needed = int(args.max_tokens * ratio)
+    print(f"→ {name}: {tokens_needed:,} tokens")
 
     if name == "tinystories":
-        cmd = ["python", f"{DATA_DIR}/tinystories.py", "--max-tokens", str(tokens)]
+        cmd = ["python", f"{DATA_DIR}/tinystories.py", "--max-tokens", str(tokens_needed)]
         train_path = f"{DATA_DIR}/tinystories/TinyStories_train.bin"
-        val_path   = f"{DATA_DIR}/tinystories/TinyStories_val.bin"
-    elif name == "tinyshakespeare":
-        cmd = ["python", f"{DATA_DIR}/tinyshakespeare.py", "--max-tokens", str(tokens)]
-        train_path = f"{DATA_DIR}/tinyshakespeare/tiny_shakespeare_train.bin"
-        val_path   = f"{DATA_DIR}/tinyshakespeare/tiny_shakespeare_val.bin"
+        val_path = f"{DATA_DIR}/tinystories/TinyStories_val.bin"
     elif name == "fineweb":
-        cmd = ["python", f"{DATA_DIR}/fineweb.py", "--max-tokens", str(tokens)]
+        cmd = ["python", f"{DATA_DIR}/fineweb.py", "--max-tokens", str(tokens_needed)]
         train_path = f"{DATA_DIR}/fineweb10B/fineweb10B_train_000000.bin"
-        val_path   = f"{DATA_DIR}/fineweb10B/fineweb10B_val_000000.bin"
+        val_path = f"{DATA_DIR}/fineweb10B/fineweb10B_val_000000.bin"
+    elif name == "conversational":
+        ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft", streaming=True)
+        count = 0
+        for example in ds:
+            text = ""
+            for msg in example["messages"]:
+                text += msg["content"] + "\n"
+            tokens = enc.encode(text)
+            for t in tokens:
+                all_train.extend(struct.pack("H", t))
+            count += len(tokens)
+            if count >= tokens_needed:
+                break
+        continue
+    elif name == "code":
+        ds = load_dataset("codeparrot/codeparrot", split="train", streaming=True)
+        count = 0
+        for example in ds:
+            text = example["content"]
+            tokens = enc.encode(text)
+            for t in tokens:
+                all_train.extend(struct.pack("H", t))
+            count += len(tokens)
+            if count >= tokens_needed:
+                break
+        continue
 
     subprocess.run(cmd, check=True)
 
-    # Skip the old 8-byte header and take raw token data
     with open(train_path, "rb") as f:
         f.read(8)
         all_train.extend(f.read())
-
     with open(val_path, "rb") as f:
         f.read(8)
         all_val.extend(f.read())
 
-final_train = os.path.join(MIX_DIR, "train.bin")
-final_val   = os.path.join(MIX_DIR, "val.bin")
-
 def write_bin(path, data):
     num_tokens = len(data) // 2
     header = [0] * 256
-    header[0] = 20240520   # magic
-    header[1] = 1          # version
-    header[2] = num_tokens # ntok
+    header[0] = 20240520
+    header[1] = 1
+    header[2] = num_tokens
     with open(path, "wb") as f:
-        f.write(struct.pack("<256I", *header))   # full 1024-byte header
+        f.write(struct.pack("<256I", *header))
         f.write(data)
 
-write_bin(final_train, all_train)
-write_bin(final_val, all_val)
+write_bin(f"{MIX_DIR}/train.bin", all_train)
+write_bin(f"{MIX_DIR}/val.bin", all_val)
 
-print(f"\n✅ Done!")
-print(f"Final train.bin: {os.path.getsize(final_train)/1_048_576:.1f} MB")
-print(f"Final val.bin:   {os.path.getsize(final_val)/1_048_576:.1f} MB")
-print(f"\nFiles saved to: {MIX_DIR}/")
-print(f"\nNow train with:")
-print(f"./train_gpt2fp32cu -i {MIX_DIR}/train.bin -j {MIX_DIR}/val.bin -t 512 -s 50")
+print("✅ Mixed dataset ready!")
+print("Train tokens:", len(all_train)//2)
+print("Val tokens:", len(all_val)//2)
