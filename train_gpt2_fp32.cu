@@ -1566,7 +1566,7 @@ int main(int argc, char *argv[]) {
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* output_log_file = NULL;
 	const char* checkpoint_file = "gpt2_124M.bin";
-	int model_size = NULL;
+	int model_size = 0;
     int B = 4; // batch size
     int T = 1024; // sequence length max
     float learning_rate = 3e-4f;
@@ -1624,7 +1624,7 @@ int main(int argc, char *argv[]) {
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // build the GPT-2 model from a checkpoint
-	if (model_size != NULL) {
+	if (model_size != 0) {
 	    if (model_size == 15) checkpoint_file = "gpt2_15M.bin";
 	    else if (model_size == 30) checkpoint_file = "gpt2_30M.bin";
 	    else if (model_size == 70) checkpoint_file = "gpt2_70M.bin";
