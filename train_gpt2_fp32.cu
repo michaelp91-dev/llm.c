@@ -1625,9 +1625,9 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
 	if (model_size != NULL) {
-	    if (model_size = 15) checkpoint_file = "gpt2_15M.bin";
-	    else if (model_size = 30) checkpoint_file = "gpt2_30M.bin";
-	    else if (model_size = 70) checkpoint_file = "gpt2_70M.bin";
+	    if (model_size == 15) checkpoint_file = "gpt2_15M.bin";
+	    else if (model_size == 30) checkpoint_file = "gpt2_30M.bin";
+	    else if (model_size == 70) checkpoint_file = "gpt2_70M.bin";
 	}
     GPT2 model;
     gpt2_build_from_checkpoint(&model, checkpoint_file);
