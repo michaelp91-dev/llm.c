@@ -1566,6 +1566,7 @@ int main(int argc, char *argv[]) {
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* output_log_file = NULL;
 	const char* checkpoint_file = "gpt2_124M.bin";
+	int num_steps = 0;
 	int model_size = 0;
     int B = 4; // batch size
     int T = 1024; // sequence length max
@@ -1590,6 +1591,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
 		else if (argv[i][1] == 'p') { model_size = atoi(argv[i+1]); }
+		else if (argv[i][1] == 'n') { num_steps = atoi(argv[i+1]); }
         else { error_usage(); }
     }
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -1644,7 +1646,12 @@ int main(int argc, char *argv[]) {
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
-    int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
+	if (num_steps == 0) {
+    	int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
+	}
+	else {
+		int train_num_batches = num_steps;
+	}
     int val_num_batches = val_loader.num_tokens / (B*T);
     if (val_num_batches > val_max_steps) { val_num_batches = val_max_steps; }
     printf("| train_num_batches     | %-50d |\n", train_num_batches);
