@@ -1,4 +1,5 @@
 import struct
+import random
 
 def create_checkpoint(filename, layers, channels):
     Vp = 50304
@@ -13,7 +14,6 @@ def create_checkpoint(filename, layers, channels):
     header[6] = channels
     header[7] = Vp
 
-    # exact same calculation as fill_in_parameter_sizes in train_gpt2_fp32.cu
     num_params = (
         Vp * channels + maxT * channels +
         layers * (12 * channels * channels + 13 * channels) +
@@ -24,7 +24,10 @@ def create_checkpoint(filename, layers, channels):
 
     with open(filename, "wb") as f:
         f.write(struct.pack("<256I", *header))
-        f.write(b'\0' * (num_params * 4))
+        # small random init instead of zeros
+        for _ in range(num_params):
+            val = random.gauss(0.0, 0.02)  # same scale as original gpt2_124M
+            f.write(struct.pack("f", val))
 
 create_checkpoint("gpt2_15M.bin", 6, 384)
 create_checkpoint("gpt2_30M.bin", 8, 512)
