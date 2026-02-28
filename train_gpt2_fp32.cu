@@ -1565,6 +1565,8 @@ int main(int argc, char *argv[]) {
     const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
     const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* output_log_file = NULL;
+	const char* checkpoint_file = "gpt2_124M.bin";
+	const char* model_size = NULL;
     int B = 4; // batch size
     int T = 1024; // sequence length max
     float learning_rate = 3e-4f;
@@ -1587,6 +1589,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
+		else if (argv[i][1] == 'size') { model_size = atoi(argv[i+1]); }
         else { error_usage(); }
     }
     printf("+-----------------------+----------------------------------------------------+\n");
@@ -1621,11 +1624,10 @@ int main(int argc, char *argv[]) {
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // build the GPT-2 model from a checkpoint
-	const char* checkpoint_file = "gpt2_124M.bin";
-	if (strcmp(argv[i], "-size") == 0) {
-	    if (strcmp(argv[i+1], "15M") == 0) checkpoint_file = "gpt2_15M.bin";
-	    else if (strcmp(argv[i+1], "30M") == 0) checkpoint_file = "gpt2_30M.bin";
-	    else if (strcmp(argv[i+1], "70M") == 0) checkpoint_file = "gpt2_70M.bin";
+	if (model_size != NULL) {
+	    if (model_size = "15M") checkpoint_file = "gpt2_15M.bin";
+	    else if (model_size = "30M") checkpoint_file = "gpt2_30M.bin";
+	    else if (model_size = "70M") checkpoint_file = "gpt2_70M.bin";
 	}
     GPT2 model;
     gpt2_build_from_checkpoint(&model, checkpoint_file);
