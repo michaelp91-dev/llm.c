@@ -1628,7 +1628,7 @@ int main(int argc, char *argv[]) {
 	    else if (strcmp(argv[i+1], "70M") == 0) checkpoint_file = "gpt2_70M.bin";
 	}
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, checkponit_file);
+    gpt2_build_from_checkpoint(&model, checkpoint_file);
     printf("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
