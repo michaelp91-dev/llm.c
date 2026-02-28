@@ -1621,8 +1621,14 @@ int main(int argc, char *argv[]) {
     printf("+-----------------------+----------------------------------------------------+\n");
 
     // build the GPT-2 model from a checkpoint
+	const char* checkpoint_file = "gpt2_124M.bin";
+	if (strcmp(argv[i], "-size") == 0) {
+	    if (strcmp(argv[i+1], "15M") == 0) checkpoint_file = "gpt2_15M.bin";
+	    else if (strcmp(argv[i+1], "30M") == 0) checkpoint_file = "gpt2_30M.bin";
+	    else if (strcmp(argv[i+1], "70M") == 0) checkpoint_file = "gpt2_70M.bin";
+	}
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    gpt2_build_from_checkpoint(&model, checkponit_file);
     printf("| max_sequence_length T | %-50d |\n", model.config.max_seq_len);
     printf("| vocab_size V          | %-50d |\n", model.config.vocab_size);
     printf("| padded_vocab_size Vp  | %-50d |\n", model.config.padded_vocab_size);
