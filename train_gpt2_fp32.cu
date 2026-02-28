@@ -1589,7 +1589,7 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's') { sample_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
-		else if (argv[i][1] == 'size') { model_size = atoi(argv[i+1]); }
+		else if (argv[i][1] == 'p') { model_size = atoi(argv[i+1]); }
         else { error_usage(); }
     }
     printf("+-----------------------+----------------------------------------------------+\n");
