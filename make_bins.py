@@ -32,3 +32,4 @@ def create_checkpoint(filename, layers, channels):
 create_checkpoint("gpt2_15M.bin", 6, 384)
 create_checkpoint("gpt2_30M.bin", 8, 512)
 create_checkpoint("gpt2_70M.bin", 12, 640)
+create_checkpoint("gpt2_135M.bin", 12, 800)
