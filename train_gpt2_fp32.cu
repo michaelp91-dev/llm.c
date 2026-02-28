@@ -1646,11 +1646,12 @@ int main(int argc, char *argv[]) {
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
+	int train_num_batches = 1000;
 	if (num_steps == 0) {
-    	int train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
+    	train_num_batches = train_loader.num_tokens / (B*T); // let's do 1 epoch by default for now
 	}
 	else {
-		int train_num_batches = num_steps;
+		train_num_batches = num_steps;
 	}
     int val_num_batches = val_loader.num_tokens / (B*T);
     if (val_num_batches > val_max_steps) { val_num_batches = val_max_steps; }
