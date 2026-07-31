@@ -1,3 +1,5 @@
+# @title
+%%writefile train_gpt2.cu
 /*
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
@@ -316,6 +318,9 @@ typedef struct {
     bool init_state;   // set to true if master weights need to be initialized
     int gelu_fusion; // fuse gelu via cuBLASLt (0=none, 1=forward, 2=forward+backward)
     int recompute; // recompute gelu | layernorm forward during model backward? 0|1|2
+    // loss scaling for FP16 stability (scale=1.0f effectively for BF16/FP32)
+    float loss_scale;
+    int loss_scale_successes;
     // todo - if other functions need cpu scratch buffers in the future, reuse as generic scratch?
     int* workload_indices; // encoder_backward, B*T*num_c_groups (int)
     int4* bucket_info;     // encoder_backward, B*T*num_c_groups (int4) - size for worst case
@@ -348,6 +353,9 @@ void gpt2_init_common(GPT2 *model) {
     model->init_state = true;
     model->recompute = 1; // good default: recompute gelu but not layernorm
     model->gelu_fusion = 0; //deviceProp.major >= 9 ? 2 : 0; // default: off for now (default must match main())
+    // FP16 loss scaling (2^16 is a common starting value). For BF16/FP32 this stays 1.0
+    model->loss_scale = (PRECISION_MODE == PRECISION_FP16) ? 65536.0f : 1.0f;
+    model->loss_scale_successes = 0;
 }
 
 void gpt2_allocate_weights(GPT2 *model) {
@@ -436,7 +444,9 @@ void gpt2_write_to_checkpoint(GPT2 *model, const char* checkpoint_path) {
     memset(model_header, 0, sizeof(model_header));
     model_header[0] = 20240326; // magic number
     assert(PRECISION_MODE == PRECISION_FP32 || PRECISION_MODE == PRECISION_BF16 || PRECISION_MODE == PRECISION_FP16);
-    model_header[1] = (PRECISION_MODE == PRECISION_FP32) ? 3 : (PRECISION_MODE == PRECISION_FP16 ? 4 : 5); 
+    if (PRECISION_MODE == PRECISION_FP32) model_header[1] = 3;
+    else if (PRECISION_MODE == PRECISION_BF16) model_header[1] = 5;
+    else model_header[1] = 6;   // new version for FP16
     model_header[2] = model->config.max_seq_len;
     model_header[3] = model->config.vocab_size;
     model_header[4] = model->config.num_layers;
@@ -457,13 +467,21 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
     // the master weights that are instead stored in the state .bin file.
     // In that case, this function mostly loads the model hyperparameters from the header.
 
+    if (PRECISION_MODE == PRECISION_FP16) {
+        // TODO for later perhaps, would require us dynamically converting the
+        // model weights from fp32 to fp16 online, here in this function, or writing
+        // the fp16 weights directly from Python, which we only do for fp32/bf16 atm.
+        fprintf(stderr, "build_from_checkpoint() does not support fp16 right now.\n");
+        exit(EXIT_FAILURE);
+    }
+
     // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
     freadCheck(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(EXIT_FAILURE); }
     int version = model_header[1];
-    if (!(version == 3 || version == 4 || version == 5)) {
+    if (!(version == 3 || version == 5)) {
         // 3 = fp32, padded vocab
         // 5 = bf16, padded vocab, layernorms also in bf16
         fprintf(stderr, "Bad version in model file\n");
@@ -484,10 +502,6 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, bool w
             fprintf(stderr, "---> HINT: are you sure you're loading a .bin file without any _bf16 in the name?\n");
             exit(EXIT_FAILURE);
         }
-        if (PRECISION_MODE == PRECISION_FP16 && version != 4) {
-            fprintf(stderr, "Precision is FP16 but model file is not version 4.\n");
-            exit(EXIT_FAILURE);
-        } 
     }
 
     // read in hyperparameters
@@ -812,7 +826,9 @@ void gpt2_backward_and_reduce(GPT2 *model, int* inputs, const int* targets, int 
 
     // accumulate the losses inside acts.losses, and kick off the backward pass inside the fused classifier
     NvtxRange classifier_and_loss_range("classifier_and_loss");
-    const float dloss = 1.0f / (float)(B * T * grad_accum_steps); // results in the uniform average loss over all elements
+    // Scale the incoming dloss by loss_scale so gradients are larger (prevents FP16 underflow).
+    // Reported mean_loss stays unscaled because acts.losses is filled with real per-token losses.
+    const float dloss = model->loss_scale / (float)(B * T * grad_accum_steps);
     cudaCheck(cudaMemcpy(model->targets, targets, B * T * sizeof(int), cudaMemcpyHostToDevice));
     tokenCheck(targets, B*T, V);
     fused_classifier(acts.output, acts.losses, dloss, model->targets, B, T, V, Vp, True, main_stream);
@@ -1833,19 +1849,39 @@ int main(int argc, char *argv[]) {
         float zloss = (float)(update_detector(&loss_outlier_detector, (double)model.mean_loss)); // loss z-score
         // fetch the next learning rate
         float step_learning_rate = get_learning_rate(&lr_scheduler, step);
-        // calculate the gradient norm and how much we wish to scale the gradient
+        // calculate the gradient norm (this norm is scaled by loss_scale when using FP16)
         float grad_norm = gpt2_calculate_grad_norm(&model, &multi_gpu_config);
         float zgrad = (float)(update_detector(&grad_norm_outlier_detector, (double)grad_norm)); // grad z-score
-        // update the model parameters
-        if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
+
+        // FP16 loss-scale overflow detection + dynamic adjustment
+        bool overflow = !isfinite(grad_norm);
+        if (PRECISION_MODE == PRECISION_FP16 && overflow) {
+            // reduce scale and skip this update
+            model.loss_scale = fmaxf(1.0f, model.loss_scale * 0.5f);
+            model.loss_scale_successes = 0;
+            printf0("FP16 overflow detected (grad_norm=%f), reducing loss_scale to %g\n", grad_norm, model.loss_scale);
+        } else if (isfinite(zloss) && skip_update_lossz != 0.0f && zloss > skip_update_lossz) {
             printf0("skipping update due to loss z-score of %f\n", zloss);
         } else if (isfinite(zgrad) && skip_update_gradz != 0.0f && zgrad > skip_update_gradz) {
             printf0("skipping update due to grad z-score of %f\n", zgrad);
         } else {
-            // clip the gradient norm to a maximum value
+            // Normal path: unscale gradients (divide by loss_scale) then apply grad clipping
             float grad_clip = 1.0f;
-            float grad_scale = (grad_norm > grad_clip) ? grad_clip / grad_norm : 1.0f;
+            float inv_loss_scale = 1.0f / model.loss_scale;
+            float grad_scale = (grad_norm * inv_loss_scale > grad_clip)
+                                ? (grad_clip / grad_norm)   // already includes the unscale
+                                : inv_loss_scale;
             gpt2_update(&model, step_learning_rate, 0.9f, 0.95f, 1e-8f, weight_decay, grad_scale, step+1, &multi_gpu_config);
+
+            // Grow the loss scale periodically when training is stable
+            if (PRECISION_MODE == PRECISION_FP16) {
+                model.loss_scale_successes++;
+                if (model.loss_scale_successes >= 2000) {
+                    model.loss_scale *= 2.0f;
+                    model.loss_scale_successes = 0;
+                    printf0("increasing loss_scale to %g\n", model.loss_scale);
+                }
+            }
         }
         cudaCheck(cudaEventRecord(end));
         cudaCheck(cudaEventSynchronize(end)); // wait for the end event to finish to get correct timings
