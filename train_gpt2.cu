@@ -1,5 +1,3 @@
-# @title
-%%writefile train_gpt2.cu
 /*
 GPT-2 Transformer Neural Net training loop. See README.md for usage.
 */
