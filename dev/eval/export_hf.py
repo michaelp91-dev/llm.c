@@ -1,4 +1,3 @@
-%%writefile export_hf.py
 """
 Script to convert GPT2 models from llm.c binary format to Hugging Face
 
