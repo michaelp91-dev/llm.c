@@ -1,11 +1,13 @@
 /*
 Attention, as a fallback when we do not use the Flash Attention from cuDNN
+Optional RoPE: pass non-NULL cos/sin tables to rotate Q and K after permute.
 */
 #include <assert.h>
 // llmc internal imports
 #include "cuda_common.h"
 #include "cuda_utils.cuh"
 #include "cublas_common.h"
+#include "rope.cuh"
 
 // ----------------------------------------------------------------------------
 // CUDA kernels
@@ -131,7 +133,7 @@ __global__ void softmax_forward_kernel5(floatX* out, float inv_temperature, cons
     if(4*pos_by_4 + lane_id <= own_pos) {
         float old_maxval = maxval;
         maxval = fmaxf(maxval, (float)x[4*pos_by_4 + lane_id]);
-        sumval *= expf(inv_temperature * (old_maxval - maxval));
+        sumval *= expf(inv_temperature * (maxval - maxval));
         sumval += expf(inv_temperature * ((float)x[4*pos_by_4 + lane_id] - maxval));
     }
 
@@ -192,9 +194,12 @@ __global__ void softmax_autoregressive_backward_inplace_kernel(floatX* datt, con
 // ----------------------------------------------------------------------------
 // kernel launchers
 
+// cos/sin may be NULL to disable RoPE (legacy absolute position models)
 void attention_forward(floatX* out, floatX* qkvr, floatX* att,
                        floatX* inp,
-                       int B, int T, int C, int NH, cudaStream_t stream) {
+                       int B, int T, int C, int NH,
+                       const float* rope_cos, const float* rope_sin,
+                       cudaStream_t stream) {
     NVTX_RANGE_FN();
     // Note: `inp` is not needed for backward pass, so we re-use it as a scratch buffer.
     // Its contents will be overwritten by this function.
@@ -213,6 +218,11 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
     int total_threads = B * NH * T * HS;
     int num_blocks = CEIL_DIV(total_threads, block_size);
     permute_kernel<<<num_blocks, block_size, 0, stream>>>(q, k, v, inp, B, T, NH, HS);
+
+    // Apply RoPE to Q and K (V unchanged)
+    if (rope_cos != nullptr && rope_sin != nullptr) {
+        rope_forward(q, k, rope_cos, rope_sin, B, NH, T, HS, stream);
+    }
 
     floatX* preatt = inp; // reuse inp as scratch buffer
     matmul_cublaslt(preatt, k, q, nullptr, T, T, HS, stream, true, false, B * NH, T * HS, T * HS, T * T);
@@ -239,7 +249,9 @@ void attention_forward(floatX* out, floatX* qkvr, floatX* att,
 void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scratch,
                         const floatX* dout,
                         const floatX* qkvr, const floatX* att,
-                        int B, int T, int C, int NH, cudaStream_t stream) {
+                        int B, int T, int C, int NH,
+                        const float* rope_cos, const float* rope_sin,
+                        cudaStream_t stream) {
     NVTX_RANGE_FN();
     const int block_size = 256;
     const int HS = C / NH; // head size
@@ -269,6 +281,12 @@ void attention_backward(floatX* dinp, floatX* dqkvr, floatX* datt, floatX* scrat
     matmul_cublaslt(dq, k, dpreatt, nullptr, HS, T, T, stream, false, false, B * NH, T * HS, T * T, T * HS);
     // backward into k
     matmul_cublaslt(dk, q, dpreatt, nullptr, HS, T, T, stream, false, true, B * NH, T * HS, T * T, T * HS);
+
+    // RoPE backward: rotate dq/dk by conjugate before unpermute into dinp
+    if (rope_cos != nullptr && rope_sin != nullptr) {
+        rope_backward(dq, dk, rope_cos, rope_sin, B, NH, T, HS, stream);
+    }
+
     // backward into inp
     num_blocks = CEIL_DIV(B * NH * T * HS, block_size);
     permute_kernel_backward<<<num_blocks, block_size, 0, stream>>>(dinp, dq, dk, dv, B, T, NH, HS);
