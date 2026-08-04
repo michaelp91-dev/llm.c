@@ -113,8 +113,10 @@ fi
 # ---------------------------------------------------------------------------
 # 2. Compile (idempotent)
 # ---------------------------------------------------------------------------
-echo ">>> Compiling train_gpt2cu (USE_CUDNN=1)..."
-make train_gpt2cu USE_CUDNN=1
+# Colab usually does not have the cuDNN frontend, so we build the pure CUDA
+# kernels with FP16. This is the reliable path for short tests.
+echo ">>> Compiling train_gpt2cu (PRECISION=FP16, no cuDNN)..."
+make train_gpt2cu PRECISION=FP16
 
 # ---------------------------------------------------------------------------
 # 3. 100-step training run
