@@ -24,6 +24,9 @@ if [[ -f "$TRAIN_BIN" && -f "$VAL_BIN" ]]; then
     echo ">>> Tiny dataset already present ($TRAIN_BIN, $VAL_BIN) – skipping creation"
 else
     echo ">>> Creating tiny mixed dataset (~${TARGET_TOKENS} tokens)..."
+    # Note: we use os._exit(0) at the end to avoid a known HF datasets
+    # streaming cleanup crash (PyGILState_Release) that happens after
+    # the files have already been written successfully.
     python3 - << 'PY'
 import struct, os, numpy as np
 from datasets import load_dataset, interleave_datasets
@@ -101,6 +104,9 @@ with open("Generic124M_test_dataset_info.txt", "w") as f:
     f.write("Mix: FineWeb-Edu 55% | Cosmopedia-v2 25% | Python-Code-Large 15% | OpenHermes-2.5 5%\n")
 
 print("Wrote Generic124M_test_val.bin and Generic124M_test_train_0.bin")
+
+# Force a clean exit so HF datasets streaming threads don't crash the process
+os._exit(0)
 PY
 fi
 
