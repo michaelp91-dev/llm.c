@@ -2,6 +2,8 @@
 The GPT-2 Encoder, which combines two encodings: token and position
 In the forward pass, both encodings are added together
 In the backward pass, the gradients flow to both, handled by different kernels
+
+When wpe is NULL, only token embeddings are used (RoPE models).
 */
 #include <assert.h>
 #include <stdint.h>
@@ -32,13 +34,20 @@ __global__ void encoder_forward_kernel3(floatX* out,
 
     floatX* out_btc = out + b * T * C + t * C + c;
     const floatX* wte_ix = wte + ix * C + c;
-    const floatX* wpe_tc = wpe + t * C + c;
 
     x128 packed_out;
     x128 wte128 = load128cs(wte_ix);
-    x128 wpe128 = load128cs(wpe_tc);
-    for (int k = 0; k < x128::size; k++) {
-        packed_out[k] = (floatX)((float)wte128[k] + (float)wpe128[k]);
+    if (wpe != nullptr) {
+        const floatX* wpe_tc = wpe + t * C + c;
+        x128 wpe128 = load128cs(wpe_tc);
+        for (int k = 0; k < x128::size; k++) {
+            packed_out[k] = (floatX)((float)wte128[k] + (float)wpe128[k]);
+        }
+    } else {
+        // token-only (RoPE): no position embedding added
+        for (int k = 0; k < x128::size; k++) {
+            packed_out[k] = wte128[k];
+        }
     }
     store128(out_btc, packed_out);
 }
@@ -154,6 +163,7 @@ __global__ void wpe_backward_kernel(floatX* dwpe,
 // ----------------------------------------------------------------------------
 // kernel launchers
 
+// wpe may be NULL for RoPE models (token embeddings only)
 void encoder_forward(floatX* out,
                      const int* inp, const floatX* wte, const floatX* wpe,
                      int B, int T, int C, cudaStream_t stream) {
@@ -166,18 +176,21 @@ void encoder_forward(floatX* out,
 }
 
 // Fully deterministic (see comments in wte_backward_kernel and wpe_backward_kernel for more details)
+// dwpe may be NULL for RoPE models
 void encoder_backward(floatX* dwte, floatX* dwpe, floatX* scratch, // gpu outputs & scratch
                       int* workload_indices, int4* bucket_info,    // cpu scratch buffers
                       const floatX* dout, const int* inp, const int* inputs_cpu, // cpu/gpu inputs
                       int B, int T, int C, unsigned int seed, cudaStream_t stream) {
     NVTX_RANGE_FN();
 
-    // Launch wpe kernel first (so it runs on the GPU in parallel with the CPU pre-processing for wte)
+    // Launch wpe kernel first only if we have position embeddings (so it runs on the GPU in parallel with the CPU pre-processing for wte)
     const int block_size = 256;
-    const int N = T * C / x128::size;
-    const int grid_size = CEIL_DIV(N, block_size);
-    wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
-    cudaCheck(cudaGetLastError());
+    if (dwpe != nullptr) {
+        const int N = T * C / x128::size;
+        const int grid_size = CEIL_DIV(N, block_size);
+        wpe_backward_kernel<<<grid_size, block_size, 0, stream>>>(dwpe, dout, inp, B, T, C, seed);
+        cudaCheck(cudaGetLastError());
+    }
 
     // check the GPU scratch buffer is large enough to hold the bucket info and workload indices
     // todo - this is trivially true given hardcoded scratch buffer size here, is this useful?
