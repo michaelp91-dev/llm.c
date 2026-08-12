@@ -1074,7 +1074,34 @@ int sample_mult(float* probabilities, int n, float coin) {
 
 // ----------------------------------------------------------------------------
 // main training loop
-int main() {
+int main(int argc, char *argv[]) {
+
+    // default hyperparameters
+    int B = 4; // batch size
+    int T = 64; // sequence length
+    int train_steps = 40; // number of training steps (-1 = full dataset)
+
+    // parse command line flags: -s steps, -b batch_size, -sl sequence_length
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-s") == 0 && i + 1 < argc) {
+            train_steps = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-b") == 0 && i + 1 < argc) {
+            B = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-sl") == 0 && i + 1 < argc) {
+            T = atoi(argv[++i]);
+        } else {
+            printf("Unknown argument: %s\n", argv[i]);
+            printf("Usage: %s [-s steps] [-b batch_size] [-sl sequence_length]\n", argv[0]);
+            printf("  -s  number of training steps (default 40, -1 = full dataset)\n");
+            printf("  -b  batch size (default 4)\n");
+            printf("  -sl sequence length (default 64)\n");
+            return 1;
+        }
+    }
+    if (B <= 0 || T <= 0) {
+        printf("Error: batch size and sequence length must be positive\n");
+        return 1;
+    }
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
@@ -1087,14 +1114,19 @@ int main() {
     const char* tiny_shakespeare_val = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
     const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
     const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
-    int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
-    int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader, val_loader;
     dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
     dataloader_init(&val_loader, val_tokens, B, T, 0, 1, 0);
     printf("train dataset num_batches: %zu\n", train_loader.num_tokens / (B*T));
     printf("val dataset num_batches: %zu\n", val_loader.num_tokens / (B*T));
     int val_num_batches = 5;
+
+    if (train_steps == -1) {
+        train_steps = (int)(train_loader.num_tokens / (B * T));
+        printf("Running full dataset: %d steps\n", train_steps);
+    } else {
+        printf("Training for %d steps\n", train_steps);
+    }
 
     // build the Tokenizer
     Tokenizer tokenizer;
@@ -1106,8 +1138,9 @@ int main() {
     const int genT = 64; // number of steps of inference we will do
 
     // train
-    struct timespec start, end;
-    for (int step = 0; step <= 40; step++) {
+    struct timespec start, end, total_start;
+    clock_gettime(CLOCK_MONOTONIC, &total_start);
+    for (int step = 0; step < train_steps; step++) {
 
         // once in a while estimate the validation loss
         if (step % 10 == 0) {
@@ -1168,7 +1201,10 @@ int main() {
         gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
-        printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
+        double total_time_s = (end.tv_sec - total_start.tv_sec) + (end.tv_nsec - total_start.tv_nsec) / 1e9;
+        double tok_per_s = (double)(B * T) / time_elapsed_s;
+        printf("Step %d/%d: training loss: %f time: %.0fms total_time: %.0f seconds tok/s: %.0f\n",
+               step + 1, train_steps, model.mean_loss, time_elapsed_s * 1000.0, total_time_s, tok_per_s);
     }
 
     // free
