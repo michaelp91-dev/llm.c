@@ -1083,6 +1083,7 @@ int main(int argc, char *argv[]) {
     int genT = 64; // tokens to generate when sampling
     int val_every = 10; // steps between val loss (-1 = only final step)
     int gen_every = 20; // steps between sample generation (-1 = only final step)
+    const char* model_path = "gpt2_124M.bin"; // model checkpoint path
 
     // parse command line flags
     for (int i = 1; i < argc; i++) {
@@ -1098,15 +1099,18 @@ int main(int argc, char *argv[]) {
             val_every = atoi(argv[++i]);
         } else if (strcmp(argv[i], "-gs") == 0 && i + 1 < argc) {
             gen_every = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-m") == 0 && i + 1 < argc) {
+            model_path = argv[++i];
         } else {
             printf("Unknown argument: %s\n", argv[i]);
-            printf("Usage: %s [-s steps] [-b batch_size] [-sl sequence_length] [-tg tokens] [-vl val_every] [-gs gen_every]\n", argv[0]);
+            printf("Usage: %s [-s steps] [-b batch_size] [-sl sequence_length] [-tg tokens] [-vl val_every] [-gs gen_every] [-m model_path]\n", argv[0]);
             printf("  -s  number of training steps (default 40, -1 = full dataset)\n");
             printf("  -b  batch size (default 4)\n");
             printf("  -sl sequence length (default 64)\n");
             printf("  -tg tokens to generate when sampling (default 64)\n");
             printf("  -vl val loss every N steps (default 10, -1 = only final step)\n");
             printf("  -gs generate sample every N steps (default 20, -1 = only final step)\n");
+            printf("  -m  model checkpoint path (default gpt2_124M.bin)\n");
             return 1;
         }
     }
@@ -1117,7 +1121,7 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+    gpt2_build_from_checkpoint(&model, model_path);
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
     const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
