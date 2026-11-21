@@ -1357,6 +1357,60 @@ void delete_checkpoint(const char* output_log_dir, int step, MultiGpuConfig* mul
     }
 }
 
+// ----------------------------------------------------------------------------
+// optional: push checkpoints to the Hugging Face Hub in the background (-hf repo_id)
+
+int copy_file_(const char* src, const char* dst) {
+    FILE* in = fopen(src, "rb");
+    if (in == NULL) { return -1; }
+    FILE* out = fopen(dst, "wb");
+    if (out == NULL) { fclose(in); return -1; }
+    char buf[1 << 16];
+    size_t n;
+    int ok = 1;
+    while ((n = fread(buf, 1, sizeof(buf), in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) { ok = 0; break; }
+    }
+    fclose(in);
+    if (fclose(out) != 0) { ok = 0; }
+    return ok ? 0 : -1;
+}
+
+void stage_file_(const char* src_dir, const char* dst_dir, const char* name, int hardlink) {
+    char src[1024], dst[1024];
+    snprintf(src, sizeof(src), "%s/%s", src_dir, name);
+    snprintf(dst, sizeof(dst), "%s/%s", dst_dir, name);
+    remove(dst);
+    // a hardlink keeps the data alive even if -nk deletes the checkpoint while it uploads
+    if (hardlink && link(src, dst) == 0) { return; }
+    if (copy_file_(src, dst) != 0) { printf("Warning: hf push: could not stage %s\n", src); }
+}
+
+void hf_push_checkpoint(const char* output_log_dir, int step, const char* hf_repo, int num_processes) {
+    // rank 0 only. stage the checkpoint into output_log_dir/.hf_push/step_XXXXXXXX, then hand it to
+    // dev/hf_push.py running in the background, so training never waits for the upload.
+    // the token is read by huggingface_hub from the HF_TOKEN environment variable.
+    char staging[1024], name[256], cmd[4096];
+    snprintf(staging, sizeof(staging), "%s/.hf_push", output_log_dir);
+    create_dir_if_not_exists(staging);
+    snprintf(staging, sizeof(staging), "%s/.hf_push/step_%08d", output_log_dir, step);
+    create_dir_if_not_exists(staging);
+    snprintf(name, sizeof(name), "model_%08d.bin", step);
+    stage_file_(output_log_dir, staging, name, 1);
+    for (int r = 0; r < num_processes; r++) {
+        snprintf(name, sizeof(name), "state_%08d_%05d.bin", step, r);
+        stage_file_(output_log_dir, staging, name, 1);
+    }
+    stage_file_(output_log_dir, staging, "main.log", 0); // copy, the log keeps growing
+    snprintf(name, sizeof(name), "DONE_%08d", step);
+    stage_file_(output_log_dir, staging, name, 1); // DONE last: marks the staged checkpoint complete
+    const char* python = getenv("LLMC_PYTHON") ? getenv("LLMC_PYTHON") : "python3";
+    snprintf(cmd, sizeof(cmd), "nohup %s dev/hf_push.py --repo '%s' --staging '%s' >> '%s/hf_push.log' 2>&1 &",
+             python, hf_repo, staging, output_log_dir);
+    printf("Pushing checkpoint at step %d to hf://%s in the background (log: %s/hf_push.log)\n", step, hf_repo, output_log_dir);
+    if (system(cmd) != 0) { printf("Warning: failed to start dev/hf_push.py\n"); }
+}
+
 #ifndef TESTING
 // if we are TESTING (see test_gpt2.cu), we'll skip everything below this point
 
@@ -1382,6 +1436,8 @@ void error_usage() {
     fprintf(stderr, "  -nk <int>   max number of checkpoints to keep in the directory, removing old ones (0 = disable, default)\n");
     fprintf(stderr, "  -nm <int>   every how many step checkpoints are considered major? major checkpoints never get deleted.\n");
     fprintf(stderr, "  -y <int>    resume optimization found inside output log dir? (0=restart/overwrite, 1=resume/append)\n");
+    fprintf(stderr, "  -hf <string> push checkpoints to this Hugging Face model repo (created private), needs HF_TOKEN env (default = NULL, off)\n");
+    fprintf(stderr, "  -hn <int>   push a checkpoint to -hf at most every this many steps (default = 0, every checkpoint; the last one is always pushed)\n");
     // token layout for each step of the optimization
     fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
     fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
@@ -1461,6 +1517,8 @@ int main(int argc, char *argv[]) {
     int hellaswag_eval = 0;
     int stream_train_data = 0; // -W: train shards are still being produced, wait for them
     int stream_expected_shards = 0; // -WN: number of train shards the producer will write (0 = use STREAM_DONE)
+    const char* hf_repo = NULL; // -hf: Hugging Face repo id to push checkpoints to
+    int hf_push_every = 0; // -hn: push at most every this many steps (0 = every checkpoint)
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1500,7 +1558,9 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
         else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
         else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
-        else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'h' && argv[i][2] == 'f') { hf_repo = argv[i+1]; }
+        else if (argv[i][1] == 'h' && argv[i][2] == 'n') { hf_push_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'h' && argv[i][2] == '\0') { hellaswag_eval = atoi(argv[i+1]); }
         else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
         else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
         else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
@@ -1554,6 +1614,8 @@ int main(int argc, char *argv[]) {
     printf0("| skip update gradz     | %-50f |\n", skip_update_gradz);
     printf0("| max_steps             | %-50d |\n", max_steps);
     printf0("| stream train data     | %-50s |\n", stream_train_data ? "yes (wait for new shards)" : "no");
+    printf0("| hf push repo          | %-50s |\n", hf_repo ? hf_repo : "NULL");
+    printf0("| hf push every         | %-50d |\n", hf_push_every);
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
     printf0("| val_max_steps         | %-50d |\n", val_max_steps);
     printf0("| sample_every          | %-50d |\n", sample_every);
@@ -1570,6 +1632,20 @@ int main(int argc, char *argv[]) {
     printf0("| peak TFlops           | %-50.1f |\n", get_flops_promised(deviceProp.name, PRECISION_MODE));
     printf0("| precision             | %-50s |\n", precision_str);
     printf0("+-----------------------+----------------------------------------------------+\n");
+
+    if (hf_repo != NULL) {
+        if (output_log_dir == NULL || checkpoint_every <= 0) {
+            printf0("Error: -hf pushes checkpoints, so it needs -o output_log_dir and -n checkpoint_every\n");
+            exit(EXIT_FAILURE);
+        }
+        if (strchr(hf_repo, '\'') != NULL || strchr(output_log_dir, '\'') != NULL || access("dev/hf_push.py", F_OK) != 0) {
+            printf0("Error: -hf needs dev/hf_push.py (run from the llm.c root) and no quotes in -hf / -o\n");
+            exit(EXIT_FAILURE);
+        }
+        if (getenv("HF_TOKEN") == NULL) {
+            printf0("Warning: HF_TOKEN is not set, dev/hf_push.py will rely on a cached huggingface-cli login\n");
+        }
+    }
 
     // figure out if we are going to be resuming the optimization
     int resuming = 0;
@@ -1703,6 +1779,7 @@ int main(int argc, char *argv[]) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
         load_state(&step, &model, &train_loader, filename_buffer);
     }
+    int hf_last_push_step = step; // the checkpoint we resumed from is already pushed (or local)
 
     // init an OutlierDetector the training loss
     OutlierDetector loss_outlier_detector, grad_norm_outlier_detector;
@@ -1824,6 +1901,13 @@ int main(int argc, char *argv[]) {
             ((step > 0 && step % checkpoint_every == 0) || last_step)) {
             // writes model .bin file, state .bin files, and DONE file for step
             write_checkpoint(output_log_dir, step, &model, &train_loader, &multi_gpu_config);
+            // optionally push it to the Hugging Face Hub in the background (before any -nk deletion below)
+            if (hf_repo != NULL && (hf_push_every <= 0 || last_step || step / hf_push_every > hf_last_push_step / hf_push_every)) {
+                if (multi_gpu_config.process_rank == 0) {
+                    hf_push_checkpoint(output_log_dir, step, hf_repo, multi_gpu_config.num_processes);
+                }
+                hf_last_push_step = step;
+            }
             // we only keep checkpoints_keep checkpoints on disk to save space
             // so now that we wrote a new checkpoint, delete one old one (unless it is a "major" checkpoint)
             // we only do this is checkpoint keeping is turned on (checkpoints_keep > 0)
