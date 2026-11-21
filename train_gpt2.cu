@@ -522,6 +522,7 @@ void gpt2_set_hyperparameters(GPT2Config* config, const char* depth_str) {
     int channels, num_heads;
     if      (depth == 6)  { channels = 384; num_heads = 6; }   // (unofficial) gpt2-tiny (30M)
     else if (depth == 12) { channels = 768; num_heads = 12; }  // gpt2 (124M)
+    else if (depth == 16) { channels = 1024; num_heads = 16; } // (unofficial) gpt2-d16 (~254M)
     else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
     else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
     else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
