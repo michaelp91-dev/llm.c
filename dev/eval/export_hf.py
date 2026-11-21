@@ -148,7 +148,10 @@ def spin(output):
     print('-'*80)
     from transformers import AutoModelForCausalLM, AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(output)
-    model = AutoModelForCausalLM.from_pretrained(output, attn_implementation="flash_attention_2", torch_dtype=torch.bfloat16, device_map='cuda')
+    # only ask for FlashAttention-2 if the flash_attn package is installed, otherwise use PyTorch SDPA
+    import importlib.util
+    attn = "flash_attention_2" if importlib.util.find_spec("flash_attn") is not None else "sdpa"
+    model = AutoModelForCausalLM.from_pretrained(output, attn_implementation=attn, torch_dtype=torch.bfloat16, device_map='cuda')
     model.eval()
     tokens = tokenizer.encode("During photosynthesis in green plants", return_tensors="pt")
     tokens = tokens.to('cuda')
