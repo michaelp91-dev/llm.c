@@ -21,6 +21,9 @@ Implements:
 // implementation of glob for Windows is in dev/unistd.h
 #ifndef _WIN32
 #include <glob.h>
+#include <unistd.h> // access, sleep (used by the streaming mode below)
+#else
+#define sleep(s) Sleep((s) * 1000)
 #endif
 // ----------------------------------------------------------------------------
 // Distributed Data Loader
@@ -56,10 +59,18 @@ typedef struct {
     size_t local_batch_offset_bytes;  // inner-sample offset for this process
     size_t header_bytes;  // header size in bytes
     int64_t file_size_bytes;
+    // streaming mode: shards are still being written by a producer (e.g. dev/data/climbmix_stream.py)
+    // when we run out of known shards we re-glob and wait for the next one instead of wrapping.
+    // the producer is done when <dir of pattern>/STREAM_DONE exists or stream_expected_shards are present.
+    // in streaming mode shards are visited in (sorted) filename order; samples within a shard are still shuffled.
+    int stream;
+    int stream_expected_shards; // 0 = unknown, rely on the STREAM_DONE marker
+    char* filename_pattern;
+    char* stream_done_path;
 } DataLoader;
 
 int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
-    if (loader->should_shuffle) {
+    if (loader->should_shuffle && !loader->stream) {
         shard_index = loader->shard_indices[shard_index];
     }
     // use the first glob match as the filename for now
@@ -96,6 +107,52 @@ int64_t dataloader_load_shard_(DataLoader *loader, int shard_index) {
     return ntok;
 }
 
+// ----------------------------------------------------------------------------
+// streaming helpers
+
+int dataloader_stream_done_(DataLoader *loader) {
+    if (loader->stream_expected_shards > 0 &&
+        loader->glob_result.gl_pathc >= (size_t) loader->stream_expected_shards) { return 1; }
+    return access(loader->stream_done_path, F_OK) == 0;
+}
+
+void dataloader_reglob_(DataLoader *loader) {
+    // shard files are written to a temp name and atomically renamed, and filenames are
+    // zero-padded, so a new glob only ever appends to the (sorted) list we already have
+    glob_t fresh;
+    memset(&fresh, 0, sizeof(fresh));
+    if (glob(loader->filename_pattern, 0, NULL, &fresh) != 0) { globfree(&fresh); return; }
+    if (fresh.gl_pathc <= loader->glob_result.gl_pathc) { globfree(&fresh); return; }
+    globfree(&loader->glob_result);
+    loader->glob_result = fresh;
+    if (loader->should_shuffle) {
+        // shard order is not permuted in streaming mode, but keep shard_indices valid (it is saved in the state)
+        free(loader->shard_indices);
+        loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
+        init_identity_permutation(loader->shard_indices, (int) loader->glob_result.gl_pathc);
+    }
+}
+
+// block until shard `shard_idx` exists. returns 1 if it is available, 0 if the producer is done without it
+int dataloader_wait_for_shard_(DataLoader *loader, size_t shard_idx) {
+    int polls = 0;
+    while (1) {
+        if (shard_idx < loader->glob_result.gl_pathc) { return 1; }
+        // check the marker before globbing: the producer renames all shards before writing it
+        int done = dataloader_stream_done_(loader);
+        dataloader_reglob_(loader);
+        if (shard_idx < loader->glob_result.gl_pathc) { return 1; }
+        if (done) { return 0; }
+        if (polls % 60 == 0 && loader->process_rank == 0) {
+            printf("DataLoader: waiting for shard %zu of %s (%zu available so far)\n",
+                   shard_idx, loader->filename_pattern, loader->glob_result.gl_pathc);
+            fflush(stdout);
+        }
+        polls++;
+        sleep(1);
+    }
+}
+
 void prepare_intra_shard_indices_(DataLoader *loader) {
     // shuffle the examples inside the shards
     if (loader->intra_shard_indices != NULL) {
@@ -111,7 +168,7 @@ void dataloader_reset(DataLoader *loader) {
     loader->current_shard_idx = 0;
     loader->current_sample_idx = 0;
 
-    if (loader->should_shuffle) {  // shuffle the shards
+    if (loader->should_shuffle && !loader->stream) {  // shuffle the shards
         random_permutation(loader->shard_indices, (int) loader->glob_result.gl_pathc, &loader->shuffle_rng);
     }
 
@@ -124,9 +181,12 @@ void dataloader_reset(DataLoader *loader) {
 
 void dataloader_advance_(DataLoader *loader) {
     if (loader->current_shard_idx == loader->glob_result.gl_pathc - 1) {
-        // if we are at the last shard, we reset the loader and start a new epoch
-        dataloader_reset(loader);
-        return;
+        // streaming: the next shard may still be in production, wait for it instead of wrapping
+        if (!loader->stream || !dataloader_wait_for_shard_(loader, loader->current_shard_idx + 1)) {
+            // if we are at the last shard, we reset the loader and start a new epoch
+            dataloader_reset(loader);
+            return;
+        }
     }
 
     // advance the loader by loading the next data shard and resetting the position
@@ -139,13 +199,15 @@ void dataloader_advance_(DataLoader *loader) {
     }
 }
 
-void dataloader_init(DataLoader *loader,
-                     const char* filename_pattern,
-                     size_t B,
-                     size_t T,
-                     int process_rank,
-                     int num_processes,
-                     int should_shuffle) {
+void dataloader_init_(DataLoader *loader,
+                      const char* filename_pattern,
+                      size_t B,
+                      size_t T,
+                      int process_rank,
+                      int num_processes,
+                      int should_shuffle,
+                      int stream,
+                      int stream_expected_shards) {
     loader->process_rank = process_rank;
     loader->num_processes = num_processes;
     loader->B = B;
@@ -155,22 +217,47 @@ void dataloader_init(DataLoader *loader,
     loader->header_bytes = HEADER_SIZE * sizeof(int);
     loader->total_batch_size_bytes = ((loader->num_processes * (loader->B * loader->T)) * sizeof(uint16_t));
     loader->local_batch_offset_bytes = loader->process_rank * loader->B * loader->T * sizeof(uint16_t);
+    loader->stream = stream;
+    loader->stream_expected_shards = stream_expected_shards;
+    loader->filename_pattern = NULL;
+    loader->stream_done_path = NULL;
+    loader->shard_indices = NULL;
+    memset(&loader->glob_result, 0, sizeof(glob_t));
 
-    // glob to get the list of files matching the pattern, these are our data shards
-    int glob_status = glob(filename_pattern, 0, NULL, &loader->glob_result);
-    if (glob_status != 0) {
-        printf("Error: failed to glob pattern: %s\n", filename_pattern);
-        exit(EXIT_FAILURE);
-    }
-    if (loader->glob_result.gl_pathc == 0) {
-        printf("Error: no files found matching the pattern: %s\n", filename_pattern);
-        exit(EXIT_FAILURE);
+    if (stream) {
+        // remember the pattern, and look for the STREAM_DONE marker next to the shards
+        size_t plen = strlen(filename_pattern);
+        loader->filename_pattern = (char*)mallocCheck(plen + 1);
+        strcpy(loader->filename_pattern, filename_pattern);
+        const char* slash = strrchr(filename_pattern, '/');
+        size_t dlen = slash ? (size_t)(slash - filename_pattern) : 1;
+        loader->stream_done_path = (char*)mallocCheck(dlen + 16);
+        if (slash) { memcpy(loader->stream_done_path, filename_pattern, dlen); }
+        else { loader->stream_done_path[0] = '.'; }
+        strcpy(loader->stream_done_path + dlen, "/STREAM_DONE");
+        // wait for at least the first shard to show up
+        if (!dataloader_wait_for_shard_(loader, 0)) {
+            printf("Error: producer is done but no files match the pattern: %s\n", filename_pattern);
+            exit(EXIT_FAILURE);
+        }
+    } else {
+        // glob to get the list of files matching the pattern, these are our data shards
+        int glob_status = glob(filename_pattern, 0, NULL, &loader->glob_result);
+        if (glob_status != 0) {
+            printf("Error: failed to glob pattern: %s\n", filename_pattern);
+            exit(EXIT_FAILURE);
+        }
+        if (loader->glob_result.gl_pathc == 0) {
+            printf("Error: no files found matching the pattern: %s\n", filename_pattern);
+            exit(EXIT_FAILURE);
+        }
     }
 
     if (should_shuffle) {
         mt19937_state shuffle_rng;
         manual_seed(&shuffle_rng, 42 + process_rank);
         loader->shuffle_rng = shuffle_rng;
+        free(loader->shard_indices); // may have been allocated by the streaming re-glob
         loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
         init_identity_permutation(loader->shard_indices, (int) loader->glob_result.gl_pathc);
         loader->intra_shard_indices = NULL;  // dynamically allocated allowing different shard sizes
@@ -198,6 +285,29 @@ void dataloader_init(DataLoader *loader,
 
     // reset the loader, to initialize it
     dataloader_reset(loader);
+}
+
+void dataloader_init(DataLoader *loader,
+                     const char* filename_pattern,
+                     size_t B,
+                     size_t T,
+                     int process_rank,
+                     int num_processes,
+                     int should_shuffle) {
+    dataloader_init_(loader, filename_pattern, B, T, process_rank, num_processes, should_shuffle, 0, 0);
+}
+
+// like dataloader_init, but the shards matching filename_pattern may still be in production:
+// re-glob and wait for new shards instead of wrapping around to the first one (see DataLoader.stream)
+void dataloader_init_streaming(DataLoader *loader,
+                               const char* filename_pattern,
+                               size_t B,
+                               size_t T,
+                               int process_rank,
+                               int num_processes,
+                               int should_shuffle,
+                               int expected_shards) {
+    dataloader_init_(loader, filename_pattern, B, T, process_rank, num_processes, should_shuffle, 1, expected_shards);
 }
 
 void dataloader_load_batch(DataLoader* loader) {
@@ -231,6 +341,10 @@ void dataloader_next_batch(DataLoader *loader) {
 
 void dataloader_resume(DataLoader *loader, size_t current_shard_idx, size_t current_sample_idx) {
     // used during model resumption (-y 1) flag
+    if (loader->stream && !dataloader_wait_for_shard_(loader, current_shard_idx)) {
+        printf("Error: cannot resume, shard %zu of %s does not exist\n", current_shard_idx, loader->filename_pattern);
+        exit(EXIT_FAILURE);
+    }
     loader->current_shard_idx = current_shard_idx;
     loader->current_sample_idx = current_sample_idx;
     dataloader_load_shard_(loader, (int) loader->current_shard_idx);
@@ -246,6 +360,8 @@ void dataloader_free(DataLoader *loader) {
     }
     fcloseCheck(loader->tokens_file);
     globfree(&loader->glob_result);
+    free(loader->filename_pattern);
+    free(loader->stream_done_path);
 }
 
 // ----------------------------------------------------------------------------

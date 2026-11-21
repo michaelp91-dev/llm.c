@@ -34,3 +34,8 @@ dev/cuda/global_norm
 
 # log files
 *.log
+
+# dev/test binaries and streaming data
+dev/test/test_dataloader
+dev/test/test_dataloader_stream
+dev/data/climbmix/

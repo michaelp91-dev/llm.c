@@ -1294,10 +1294,16 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         // ensure the number of shards matches
         size_t glob_result_gl_pathc;
         freadCheck(&glob_result_gl_pathc, sizeof(size_t), 1, state_file);
-        assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
-        // read the shard indices
-        loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
-        freadCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
+        if (loader->stream) {
+            // streaming: the number of shards on disk changes over time and shards are visited in
+            // filename order (identity shard_indices), so skip over the saved shard indices
+            fseekCheck(state_file, glob_result_gl_pathc * sizeof(int), SEEK_CUR);
+        } else {
+            assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
+            // read the shard indices
+            loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
+            freadCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
+        }
         // ensure the number of samples matches
         size_t shard_num_samples;
         freadCheck(&shard_num_samples, sizeof(size_t), 1, state_file);
@@ -1382,6 +1388,9 @@ void error_usage() {
     fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
     // workload (number of steps)
     fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
+    // streaming data (shards still being written by e.g. dev/data/climbmix_stream.py)
+    fprintf(stderr, "  -W <int>    wait for streaming train shards? re-glob and wait instead of wrapping, requires -x (default = 0)\n");
+    fprintf(stderr, "  -WN <int>   streaming: total number of train shards expected (default = 0, wait for STREAM_DONE marker)\n");
     // optimization
     fprintf(stderr, "  -k <string> learning rate scheduler (default = cosine)\n");
     fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
@@ -1450,6 +1459,8 @@ int main(int argc, char *argv[]) {
     int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
     int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
     int hellaswag_eval = 0;
+    int stream_train_data = 0; // -W: train shards are still being produced, wait for them
+    int stream_expected_shards = 0; // -WN: number of train shards the producer will write (0 = use STREAM_DONE)
     // multi-node settings
     int num_processes = 1;  // this should be set by the slurm environment
     int process_rank = 0;  // this should be set by the slurm environment
@@ -1477,6 +1488,8 @@ int main(int argc, char *argv[]) {
         else if (argv[i][1] == 'q') { final_learning_rate_frac = atof(argv[i+1]); }
         else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
         else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'W' && argv[i][2] == '\0') { stream_train_data = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'W' && argv[i][2] == 'N') { stream_expected_shards = atoi(argv[i+1]); }
         else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
         else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
         else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
@@ -1540,6 +1553,7 @@ int main(int argc, char *argv[]) {
     printf0("| skip update lossz     | %-50f |\n", skip_update_lossz);
     printf0("| skip update gradz     | %-50f |\n", skip_update_gradz);
     printf0("| max_steps             | %-50d |\n", max_steps);
+    printf0("| stream train data     | %-50s |\n", stream_train_data ? "yes (wait for new shards)" : "no");
     printf0("| val_loss_every        | %-50d |\n", val_loss_every);
     printf0("| val_max_steps         | %-50d |\n", val_max_steps);
     printf0("| sample_every          | %-50d |\n", sample_every);
@@ -1602,7 +1616,16 @@ int main(int argc, char *argv[]) {
     // build DataLoaders for both train and val
     int permute_train_loader = (overfit_single_batch == 1) ? 0 : 1;
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, permute_train_loader);
+    if (stream_train_data) {
+        // the producer is still writing shards, so we can't derive the run length from the tokens on disk
+        if (max_steps <= 0) {
+            printf0("Error: streaming train data (-W 1) requires -x max_steps, e.g. target_tokens / total_batch_size\n");
+            exit(EXIT_FAILURE);
+        }
+        dataloader_init_streaming(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, permute_train_loader, stream_expected_shards);
+    } else {
+        dataloader_init(&train_loader, train_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, permute_train_loader);
+    }
     dataloader_init(&val_loader, val_data_pattern, B, T, multi_gpu_config.process_rank, multi_gpu_config.num_processes, 0);
     // figure out the number of training steps we will run for
     int train_num_batches = max_steps; // passed in from command line
