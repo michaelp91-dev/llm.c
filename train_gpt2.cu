@@ -1219,6 +1219,9 @@ void save_state(const char* filename, int step, GPT2* model, DataLoader* loader)
     state_header[3] = multi_gpu_config.process_rank; // rank of this process
     state_header[4] = model->use_master_weights;  // whether we're using fp32 master weights
     state_header[5] = loader->should_shuffle; // shuffle state of the dataloader
+    // dataloader geometry, lets load_state convert the position if B / T change on resume (0 in older files)
+    state_header[6] = (int) loader->B; // micro batch size
+    state_header[7] = (int) loader->T; // sequence length
     // int main state, start at 10 to leave some padding
     state_header[10] = step; // step of the optimization
     // model rng state, start at 20 to leave some padding
@@ -1254,10 +1257,22 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
     freadCheck(state_header, sizeof(int), 256, state_file);
     assert(state_header[0] == 20240527); // magic number
     assert(state_header[1] == 1); // version number
-    assert(state_header[2] == multi_gpu_config.num_processes); // number of processes
-    assert(state_header[3] == multi_gpu_config.process_rank); // rank of this process
+    int saved_num_processes = state_header[2]; // number of processes
+    if (saved_num_processes != multi_gpu_config.num_processes || state_header[3] != multi_gpu_config.process_rank) {
+        // the optimizer state is only identical on every rank (and complete) without ZeRO sharding
+        if (multi_gpu_config.zero_stage != 0) {
+            printf("Error: state %s was written by rank %d of %d processes, this is rank %d of %d with zero_stage %d\n",
+                   filename, state_header[3], saved_num_processes, multi_gpu_config.process_rank,
+                   multi_gpu_config.num_processes, multi_gpu_config.zero_stage);
+            exit(EXIT_FAILURE);
+        }
+        printf("Warning: state %s was written by rank %d of %d processes, resuming as rank %d of %d\n",
+               filename, state_header[3], saved_num_processes, multi_gpu_config.process_rank, multi_gpu_config.num_processes);
+    }
     int use_master_weights = state_header[4];  // whether we're using fp32 master weights
     int should_shuffle = state_header[5]; // shuffle state of the dataloader
+    size_t saved_B = (size_t) state_header[6]; // 0 if the file predates storing it
+    size_t saved_T = (size_t) state_header[7]; // 0 if the file predates storing it
     *step = state_header[10]; // step of the optimization
     model->rng_state = *((unsigned long long*)&state_header[20]); // random number generator state
     model->rng_state_last_update = *((unsigned long long*)&state_header[22]); // last gpt2_update
@@ -1290,6 +1305,8 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
 
     // revive the DataLoader object and its state
     loader->should_shuffle = should_shuffle;
+    size_t saved_shard_num_samples = 0;
+    int* saved_intra_shard_indices = NULL;
     if (should_shuffle == 1) {
         // ensure the number of shards matches
         size_t glob_result_gl_pathc;
@@ -1301,20 +1318,21 @@ void load_state(int* step, GPT2* model, DataLoader* loader, const char* filename
         } else {
             assert(glob_result_gl_pathc == loader->glob_result.gl_pathc);
             // read the shard indices
+            free(loader->shard_indices);
             loader->shard_indices = (int*)mallocCheck(loader->glob_result.gl_pathc * sizeof(int));
             freadCheck(loader->shard_indices, sizeof(int), loader->glob_result.gl_pathc, state_file);
         }
-        // ensure the number of samples matches
-        size_t shard_num_samples;
-        freadCheck(&shard_num_samples, sizeof(size_t), 1, state_file);
-        assert(shard_num_samples == loader->shard_num_samples);
-        // read the intra-shard indices
-        loader->intra_shard_indices = (int*)mallocCheck(loader->shard_num_samples * sizeof(int));
-        freadCheck(loader->intra_shard_indices, sizeof(int), loader->shard_num_samples, state_file);
+        // the saved intra-shard permutation (its length depends on the B*T*num_processes it was saved with)
+        freadCheck(&saved_shard_num_samples, sizeof(size_t), 1, state_file);
+        saved_intra_shard_indices = (int*)mallocCheck((saved_shard_num_samples > 0 ? saved_shard_num_samples : 1) * sizeof(int));
+        freadCheck(saved_intra_shard_indices, sizeof(int), saved_shard_num_samples, state_file);
         // read the shuffle rng state
         freadCheck(&loader->shuffle_rng, sizeof(mt19937_state), 1, state_file);
     }
-    dataloader_resume(loader, current_shard_idx, current_sample_idx);
+    // loads the saved shard; converts the position if B / T / num_processes differ from when it was saved
+    dataloader_resume_saved(loader, current_shard_idx, current_sample_idx, saved_num_processes, saved_B, saved_T,
+                            &saved_intra_shard_indices, saved_shard_num_samples);
+    free(saved_intra_shard_indices);
 
     // all done, close state file
     fcloseCheck(state_file);
@@ -1377,7 +1395,7 @@ int copy_file_(const char* src, const char* dst) {
 }
 
 void stage_file_(const char* src_dir, const char* dst_dir, const char* name, int hardlink) {
-    char src[1024], dst[1024];
+    char src[2048], dst[2048];
     snprintf(src, sizeof(src), "%s/%s", src_dir, name);
     snprintf(dst, sizeof(dst), "%s/%s", dst_dir, name);
     remove(dst);
@@ -1777,6 +1795,12 @@ int main(int argc, char *argv[]) {
     gpt2_allocate_state(&model, B, T);
     if (resuming == 1) {
         snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, multi_gpu_config.process_rank);
+        if (access(filename_buffer, F_OK) != 0 && multi_gpu_config.zero_stage == 0) {
+            // resuming on more processes than the checkpoint was written with: without ZeRO every rank
+            // holds the full optimizer state, so rank 0's state file works for all ranks
+            printf("Warning: %s not found, using rank 0's state file\n", filename_buffer);
+            snprintf(filename_buffer, sizeof(filename_buffer), "%s/state_%08d_%05d.bin", output_log_dir, resume_max_step, 0);
+        }
         load_state(&step, &model, &train_loader, filename_buffer);
     }
     int hf_last_push_step = step; // the checkpoint we resumed from is already pushed (or local)

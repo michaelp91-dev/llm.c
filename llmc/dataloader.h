@@ -350,6 +350,126 @@ void dataloader_resume(DataLoader *loader, size_t current_shard_idx, size_t curr
     dataloader_load_shard_(loader, (int) loader->current_shard_idx);
 }
 
+// Resume from a state saved with a different sample size (micro batch B, or number of processes).
+// A "sample" is num_processes*B*T tokens, so a different B splits the shard into a different number of
+// samples and the saved position / permutation no longer line up with the current loader.
+// We convert the saved position into tokens of the current shard:
+// - shuffled: every current sample that is mostly covered by already-consumed saved samples counts
+//   as seen (exact half-covered ties alternate); seen samples go first in the new permutation, the rest follow in a fresh random order
+//   (deterministic, and the loader's shuffle_rng is left untouched), and we resume right after the seen ones.
+// - not shuffled: resume at round(saved_sample_idx * saved_sample_tokens / current_sample_tokens).
+// At most a fraction of one sample's worth of tokens per boundary gets skipped or repeated.
+// saved_perm / saved_num_samples may be NULL / 0 when the loader is not shuffled.
+// call this after dataloader_resume() so the current shard (and its shard_num_samples) is loaded.
+void dataloader_convert_position_(DataLoader *loader, size_t saved_sample_idx, size_t saved_sample_tokens,
+                                  const int* saved_perm, size_t saved_num_samples) {
+    size_t new_sample_tokens = loader->num_processes * loader->B * loader->T;
+    size_t n_new = loader->shard_num_samples;
+    if (!loader->should_shuffle) {
+        size_t tokens = saved_sample_idx * saved_sample_tokens;
+        size_t idx = (tokens + new_sample_tokens / 2) / new_sample_tokens;
+        loader->current_sample_idx = idx > n_new ? n_new : idx;
+        return;
+    }
+    if (saved_sample_idx > saved_num_samples) { saved_sample_idx = saved_num_samples; }
+    // which saved samples were already consumed in this shard
+    unsigned char* consumed = (unsigned char*)mallocCheck(saved_num_samples > 0 ? saved_num_samples : 1);
+    memset(consumed, 0, saved_num_samples > 0 ? saved_num_samples : 1);
+    for (size_t i = 0; i < saved_sample_idx; i++) {
+        int k = saved_perm[i];
+        if (k >= 0 && (size_t) k < saved_num_samples) { consumed[k] = 1; }
+    }
+    unsigned char* seen = (unsigned char*)mallocCheck(n_new > 0 ? n_new : 1);
+    size_t num_seen = 0;
+    int tie = 0;
+    for (size_t j = 0; j < n_new; j++) {
+        size_t start = j * new_sample_tokens, end = start + new_sample_tokens;
+        size_t covered = 0;
+        for (size_t i = start / saved_sample_tokens; i < saved_num_samples && i * saved_sample_tokens < end; i++) {
+            if (!consumed[i]) { continue; }
+            size_t s0 = i * saved_sample_tokens, s1 = s0 + saved_sample_tokens;
+            size_t lo = s0 > start ? s0 : start, hi = s1 < end ? s1 : end;
+            if (hi > lo) { covered += hi - lo; }
+        }
+        // more than half consumed counts as seen; exactly half (e.g. B 8 -> 16 with one of the two halves
+        // consumed) alternates, so the skipped and repeated tokens roughly cancel out
+        if (2 * covered != new_sample_tokens) { seen[j] = (2 * covered > new_sample_tokens); }
+        else { seen[j] = (unsigned char) tie; tie ^= 1; }
+        num_seen += seen[j];
+    }
+    // new permutation: seen samples first (they are skipped), then the unseen ones shuffled
+    free(loader->intra_shard_indices);
+    loader->intra_shard_indices = (int*)mallocCheck((n_new > 0 ? n_new : 1) * sizeof(int));
+    size_t a = 0, b = num_seen;
+    for (size_t j = 0; j < n_new; j++) {
+        if (seen[j]) { loader->intra_shard_indices[a++] = (int) j; }
+        else { loader->intra_shard_indices[b++] = (int) j; }
+    }
+    if (n_new > num_seen) {
+        mt19937_state rng;
+        manual_seed(&rng, (unsigned int) (1337 + 7919 * loader->current_shard_idx + loader->process_rank));
+        random_permutation(loader->intra_shard_indices + num_seen, (int) (n_new - num_seen), &rng);
+    }
+    loader->current_sample_idx = num_seen;
+    free(consumed);
+    free(seen);
+}
+
+// resume from a state file: load shard current_shard_idx and restore the position in it.
+// saved_num_processes / saved_B / saved_T describe the run that wrote the state (saved_B / saved_T may be 0
+// for state files that predate storing them). saved_perm / saved_num_samples are the saved intra-shard
+// permutation (NULL / 0 if not shuffled); the loader takes ownership of saved_perm when the layout matches,
+// otherwise it is left to the caller to free. returns 1 if the position had to be converted.
+int dataloader_resume_saved(DataLoader *loader, size_t current_shard_idx, size_t current_sample_idx,
+                            int saved_num_processes, size_t saved_B, size_t saved_T,
+                            int** saved_perm, size_t saved_num_samples) {
+    // loads the saved shard, which sets loader->shard_num_samples for the current B, T, num_processes
+    dataloader_resume(loader, current_shard_idx, current_sample_idx);
+    // figure out how many tokens one saved sample was (num_processes * B * T at save time)
+    size_t cur_sample_tokens = (size_t) loader->num_processes * loader->B * loader->T;
+    size_t saved_sample_tokens = 0;
+    if (saved_B > 0 && saved_T > 0) {
+        saved_sample_tokens = (size_t) saved_num_processes * saved_B * saved_T;
+    } else if (loader->should_shuffle && saved_num_samples > 0) {
+        // older state file: recover B from the saved sample count of this shard, assuming T is unchanged
+        // (shard_num_samples = (ntok - 1) / (num_processes * B * T), see dataloader_load_shard_)
+        size_t ntok_m1 = (size_t) ((loader->file_size_bytes - (int64_t) loader->header_bytes) / sizeof(uint16_t)) - 1;
+        size_t unit = (size_t) saved_num_processes * loader->T;
+        for (size_t b = 1; b <= 65536; b++) {
+            size_t n = ntok_m1 / (unit * b);
+            if (n == saved_num_samples) { saved_sample_tokens = unit * b; saved_B = b; saved_T = loader->T; break; }
+            if (n < saved_num_samples) { break; }
+        }
+        if (saved_sample_tokens == 0) {
+            // T must have changed too; fall back to an approximate sample size
+            saved_sample_tokens = ntok_m1 / saved_num_samples;
+        }
+    } else {
+        saved_sample_tokens = cur_sample_tokens; // unknown (old file, not shuffled): assume unchanged
+    }
+    int changed = (saved_sample_tokens != cur_sample_tokens) ||
+                  (loader->should_shuffle && saved_num_samples != loader->shard_num_samples);
+    if (!changed) {
+        // same layout as when saved: restore the permutation as is
+        if (loader->should_shuffle) {
+            free(loader->intra_shard_indices);
+            loader->intra_shard_indices = *saved_perm;
+            *saved_perm = NULL;
+        }
+        return 0;
+    }
+    size_t saved_sample_idx = current_sample_idx;
+    dataloader_convert_position_(loader, saved_sample_idx, saved_sample_tokens, *saved_perm, saved_num_samples);
+    if (loader->process_rank == 0) {
+        printf("Warning: resuming with B=%zu T=%zu x%d procs (%zu tok/sample) from a state saved with B=%zu T=%zu x%d procs (%zu tok/sample): shard %zu, sample %zu/%zu -> %zu/%zu\n",
+               loader->B, loader->T, loader->num_processes, cur_sample_tokens,
+               saved_B, saved_T, saved_num_processes, saved_sample_tokens,
+               current_shard_idx, saved_sample_idx, saved_num_samples,
+               loader->current_sample_idx, loader->shard_num_samples);
+    }
+    return 1;
+}
+
 void dataloader_free(DataLoader *loader) {
     free(loader->buffer);
     free(loader->inputs);

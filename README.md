@@ -4,6 +4,7 @@ Upstream [karpathy/llm.c](https://github.com/karpathy/llm.c) with a few small, o
 
 - **Background tokenizing**: `dev/data/climbmix_stream.py` writes ClimbMix shards as it goes; `train_gpt2cu -W 1 [-WN <num_shards>]` waits for shards that are still being made instead of wrapping to the first one (needs `-x`). Shards can be cached in a private HF dataset repo (`--hf_repo`).
 - **Checkpoint pushes**: `train_gpt2cu -hf <user/repo> [-hn <steps>]` uploads each checkpoint to `ckpt/` of a private HF repo in the background (`HF_TOKEN` env), keeping only the latest; `dev/hf_pull.py` restores it for `-y 1`.
+- **Resume with a different batch size**: `-y 1` works when `-b` (or the GPU count, with `-z 0`) differs from the run that wrote the checkpoint, e.g. an L4 checkpoint at `-b 8` resumed on an A100 at `-b 16`. The position in the current shard is converted to the new sample size (a warning line shows the conversion); keep `-d` the same so the step count and LR schedule are unchanged. Test: `dev/test/test_dataloader_resume.c`.
 - CUDA 13 build fix (`cudaMemAdvise`), a `d16` depth (~254M params), and `export_hf.py` falls back to SDPA without flash_attn.
 - Colab notebook: [notebooks/llmc-d16-colab.ipynb](notebooks/llmc-d16-colab.ipynb).
 
